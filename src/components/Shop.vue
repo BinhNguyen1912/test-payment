@@ -1,4 +1,5 @@
 <script setup>
+import { fieldDoc } from '../fieldDocs.js';
 import { computed, reactive, ref, watch } from 'vue';
 import { request, sessions, signIn, uuid } from '../api.js';
 import { ctx } from '../ctxStore.js';
@@ -194,7 +195,7 @@ const json = (v) => JSON.stringify(v, null, 2);
           <div v-if="b.err" class="shop-err">{{ b.err }}</div>
           <template v-else-if="listOf(b.data)">
             <div v-if="!b.data.length" class="shop-muted">rỗng</div>
-            <div v-else class="sh-tw"><table class="sh-tb"><thead><tr><th v-for="c in cols(b.data)" :key="c">{{ c }}</th></tr></thead>
+            <div v-else class="sh-tw"><table class="sh-tb"><thead><tr><th v-for="c in cols(b.data)" :key="c" class="fd-h"><b>{{ c }}</b><span class="fd-d">({{ fieldDoc(c) }})</span></th></tr></thead>
               <tbody><tr v-for="(r, i) in b.data" :key="i"><td v-for="c in cols(b.data)" :key="c">{{ r[c] }}</td></tr></tbody></table></div>
           </template>
           <div v-else-if="b.data === null && b.status" class="shop-muted">chưa có dữ liệu (null)</div>
@@ -353,4 +354,6 @@ const json = (v) => JSON.stringify(v, null, 2);
 .sh-steps li span { color: #5f7a69; word-break: break-word; }
 .sh-steps li.sh-done { border-left-color: #10b981; background: #f0fdf4; }
 .sh-steps li.sh-fail { border-left-color: #ef4444; background: #fef2f2; }
+.fd-h { white-space: normal !important; min-width: 150px; max-width: 250px; vertical-align: top; text-transform: none !important; }
+.fd-h b { display: block; } .fd-d { display: block; font-weight: 400; color: #4b6b57; font-size: 11px; line-height: 1.35; margin-top: 2px; text-transform: none; letter-spacing: 0; }
 </style>

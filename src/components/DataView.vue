@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from 'vue';
+import { fieldDoc } from '../fieldDocs.js';
 // Renders ANY JSON as tables: array of objects -> one table with every column; object -> key/value table; nested values recurse.
 defineOptions({ name: 'DataView' });
 const props = defineProps({ data: { default: null }, depth: { type: Number, default: 0 }, onPick: { type: Function, default: null } });
@@ -27,7 +28,7 @@ const flagClass = (k, v) => {
     <p v-if="Array.isArray(data) && !data.length" class="dv-empty">Danh sách rỗng</p>
     <div v-else-if="isRows(data)" class="dv-scroll">
       <table class="dv-t">
-        <thead><tr><th class="dv-i">#</th><th v-for="c in cols" :key="c">{{ c }}</th></tr></thead>
+        <thead><tr><th class="dv-i">#</th><th v-for="c in cols" :key="c" class="dv-h"><b>{{ c }}</b><span class="dv-d">({{ fieldDoc(c) }})</span></th></tr></thead>
         <tbody>
           <tr v-for="(r, i) in data" :key="i" :class="{ 'dv-pick': onPick }" @click="onPick && onPick(r)">
             <td class="dv-i">{{ i + 1 }}</td>
@@ -43,7 +44,7 @@ const flagClass = (k, v) => {
     <table v-else-if="isObj(data)" class="dv-t dv-kv">
       <tbody>
         <tr v-for="[k, v] in entries" :key="k">
-          <th>{{ k }}</th>
+          <th class="dv-h"><b>{{ k }}</b><span class="dv-d">({{ fieldDoc(k) }})</span></th>
           <td :class="flagClass(k, v)"><DataView v-if="isComplex(v)" :data="v" :depth="depth + 1" /><template v-else>{{ scalar(v) }}</template></td>
         </tr>
       </tbody>
@@ -63,4 +64,8 @@ const flagClass = (k, v) => {
 .dv tr.dv-pick { cursor: pointer; } .dv tr.dv-pick:hover td { background: #f0fdf4; }
 .dv td.dv-t, .dv td.dv-t * { } .dv .dv-t td.dv-t { color: #15803d; font-weight: 600; } .dv .dv-t td.dv-f { color: #b91c1c; font-weight: 600; background: #fef2f2; }
 .dv-list { margin: 0; padding-left: 16px; }
+.dv .dv-t th.dv-h { white-space: normal; min-width: 150px; max-width: 260px; vertical-align: top; }
+.dv .dv-h b { display: block; }
+.dv .dv-h .dv-d { display: block; font-weight: 400; color: #4b6b57; font-size: 11px; line-height: 1.35; margin-top: 2px; }
+.dv .dv-kv th.dv-h { max-width: 340px; }
 </style>

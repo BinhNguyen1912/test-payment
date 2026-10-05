@@ -1,4 +1,5 @@
 <script setup>
+import { fieldDoc } from '../fieldDocs.js';
 import { computed, onBeforeUnmount, reactive, ref } from 'vue';
 import { request, sessions } from '../api.js';
 import { ctx, presets, addPreset } from '../ctxStore.js';
@@ -221,7 +222,7 @@ const json = (v) => JSON.stringify(v, null, 2);
             </div>
           </template>
           <template v-else>
-            <div class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(s.rows)" :key="c">{{ c }}</th></tr></thead>
+            <div class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(s.rows)" :key="c" class="fd-h"><b>{{ c }}</b><span class="fd-d">({{ fieldDoc(c) }})</span></th></tr></thead>
               <tbody><tr v-for="(r, i) in s.rows" :key="i"><td v-for="c in scal(s.rows)" :key="c">{{ cell(r[c]) }}</td></tr></tbody></table></div>
             <details v-if="objs(s.rows).length"><summary class="mf-mut">cột JSON: {{ objs(s.rows).join(', ') }}</summary><pre>{{ json(s.rows.map((r) => Object.fromEntries(objs(s.rows).map((k) => [k, r[k]])))) }}</pre></details>
           </template>
@@ -261,9 +262,9 @@ const json = (v) => JSON.stringify(v, null, 2);
         <p class="mf-mut">Không thấy dòng nào ghi Nợ vào tài khoản thuế: backend chưa có bước “nộp thuế” (chỉ tích lũy phải nộp).</p></section>
 
       <section class="mf-stage"><div class="mf-sh"><b>Nguồn doanh thu</b> <code>finance_revenue_sources</code></div>
-        <div class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(conf.sources)" :key="c">{{ c }}</th></tr></thead><tbody><tr v-for="(r, i) in conf.sources" :key="i"><td v-for="c in scal(conf.sources)" :key="c">{{ cell(r[c]) }}</td></tr></tbody></table></div></section>
+        <div class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(conf.sources)" :key="c" class="fd-h"><b>{{ c }}</b><span class="fd-d">({{ fieldDoc(c) }})</span></th></tr></thead><tbody><tr v-for="(r, i) in conf.sources" :key="i"><td v-for="c in scal(conf.sources)" :key="c">{{ cell(r[c]) }}</td></tr></tbody></table></div></section>
       <section class="mf-stage"><div class="mf-sh"><b>Loại phí / thuế</b> <code>finance_charge_types</code></div>
-        <div class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(conf.charges)" :key="c">{{ c }}</th></tr></thead><tbody><tr v-for="(r, i) in conf.charges" :key="i"><td v-for="c in scal(conf.charges)" :key="c">{{ cell(r[c]) }}</td></tr></tbody></table></div></section>
+        <div class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(conf.charges)" :key="c" class="fd-h"><b>{{ c }}</b><span class="fd-d">({{ fieldDoc(c) }})</span></th></tr></thead><tbody><tr v-for="(r, i) in conf.charges" :key="i"><td v-for="c in scal(conf.charges)" :key="c">{{ cell(r[c]) }}</td></tr></tbody></table></div></section>
       <section class="mf-stage"><div class="mf-sh"><b>Chính sách phí/thuế — phiên bản mới nhất</b> <code>finance_policy_versions + finance_policy_lines</code>
         <button @click="showOldPolicies = !showOldPolicies">{{ showOldPolicies ? 'Ẩn bản cũ' : 'Xem cả bản cũ' }}</button></div>
         <p class="mf-mut">Mỗi nguồn doanh thu có nhiều phiên bản; luôn lấy bản <b>ACTIVE</b> (nếu không có thì bản có số phiên bản cao nhất). Bút toán lưu <code>policy_version_id</code> đã dùng. Tỷ lệ = rate_bps / 100.</p>
@@ -292,7 +293,7 @@ const json = (v) => JSON.stringify(v, null, 2);
         <section v-for="blk in [['Các dòng sổ cái gần nhất', 'lines', 'finance_journal_lines'], ['Tiền bị giữ (hold)', 'holds', 'finance_holds'], ['Lệnh rút tiền', 'payouts', 'finance_payouts'], ['Tài khoản ngân hàng', 'bank', 'user_bank_accounts']]" :key="blk[1]" class="mf-stage">
           <div class="mf-sh"><b>{{ blk[0] }}</b> <code>{{ blk[2] }}</code> <span :class="['mf-pill', party[blk[1]].length ? 'mf-g' : '']">{{ party[blk[1]].length }} dòng</span></div>
           <p v-if="!party[blk[1]].length" class="mf-mut">Rỗng.</p>
-          <div v-else class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(party[blk[1]])" :key="c">{{ c }}</th></tr></thead>
+          <div v-else class="mf-tw"><table class="mf-t"><thead><tr><th v-for="c in scal(party[blk[1]])" :key="c" class="fd-h"><b>{{ c }}</b><span class="fd-d">({{ fieldDoc(c) }})</span></th></tr></thead>
             <tbody><tr v-for="(r, i) in party[blk[1]]" :key="i"><td v-for="c in scal(party[blk[1]])" :key="c">{{ cell(r[c]) }}</td></tr></tbody></table></div>
         </section>
       </template>
@@ -358,4 +359,6 @@ const json = (v) => JSON.stringify(v, null, 2);
 .mf .mf-t td.mf-wrap { white-space: normal; min-width: 170px; max-width: 280px; color: #14532d; }
 .mf .mf-t td.mf-read { background: #fffbeb; color: #92400e; min-width: 230px; }
 .mf-old { margin-top: 8px; padding-top: 6px; border-top: 1px dashed #86efac; }
+.fd-h { white-space: normal !important; min-width: 150px; max-width: 250px; vertical-align: top; }
+.fd-h b { display: block; } .fd-d { display: block; font-weight: 400; color: #4b6b57; font-size: 11px; line-height: 1.35; margin-top: 2px; text-transform: none; letter-spacing: 0; }
 </style>
