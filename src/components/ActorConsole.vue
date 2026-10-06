@@ -101,6 +101,8 @@ async function ensureWeb() {
 }
 const st = (e) => (state[e.id] ??= { loading: false, status: null, body: null, meta: null, err: '', at: '', auto: false, sent: null });
 const rows = (s) => (Array.isArray(s.body) ? s.body : null);
+// Ledger card view only when every item really has journal lines; otherwise fall back to the generic table.
+const isJournalList = (s) => Array.isArray(s.body) && s.body.length > 0 && s.body.every((j) => j && Array.isArray(j.lines));
 const scalarCols = (list) => {
   const ks = new Map();
   list.slice(0, 10).forEach((r) => Object.entries(r || {}).forEach(([k, v]) => { if (v === null || typeof v !== 'object') ks.set(k, (ks.get(k) || 0) + 1); }));
@@ -129,7 +131,7 @@ async function run(e) {
       const qs = new URLSearchParams(query).toString();
       res = await webFetch('GET', fill(e) + (qs ? `?${qs}` : ''));
     } else res = await request(session.value, 'GET', fill(e), { query, headers });
-    s.status = res.status ?? 200; s.body = res.data; s.meta = res.meta; s.at = new Date().toLocaleTimeString();
+    s.status = res.status ?? 200; s.body = res.data ?? null; s.meta = res.meta; s.empty = res.data === null || res.data === undefined; s.at = new Date().toLocaleTimeString();
     return res;
   } catch (er) {
     s.status = er.status || 'ERR'; s.body = null; s.err = `${er.code || ''} ${er.message}`.trim(); s.at = new Date().toLocaleTimeString();
@@ -173,8 +175,9 @@ const journals = (s) => {
   const l = rows(s) || [];
   return onlyOrder.value && ctx.orderId ? l.filter((j) => String(j.sourceId) === String(ctx.orderId)) : l;
 };
-const dr = (j) => j.lines.filter((x) => x.side === 'DEBIT').reduce((a, x) => a + BigInt(x.amountVnd), 0n);
-const cr = (j) => j.lines.filter((x) => x.side === 'CREDIT').reduce((a, x) => a + BigInt(x.amountVnd), 0n);
+const big = (v) => { try { return BigInt(v ?? 0); } catch { return BigInt(Math.round(Number(v) || 0)); } };
+const dr = (j) => (j.lines || []).filter((x) => x.side === 'DEBIT').reduce((a, x) => a + big(x.amountVnd), 0n);
+const cr = (j) => (j.lines || []).filter((x) => x.side === 'CREDIT').reduce((a, x) => a + big(x.amountVnd), 0n);
 const json = (v) => JSON.stringify(v, null, 2);
 watch([actor, adminKey], () => { info.blocks = []; info.at = ''; loadInfo(); });
 </script>
@@ -232,9 +235,10 @@ watch([actor, adminKey], () => { info.blocks = []; info.at = ''; loadInfo(); });
         <p v-if="st(e).err" class="ac-err">{{ st(e).err }}</p>
         <div v-if="st(e).sent && st(e).body !== null" class="ac-muted">Đã gọi: <code>{{ st(e).sent.path }}</code> <code v-if="Object.keys(st(e).sent.query).length">?{{ new URLSearchParams(st(e).sent.query).toString() }}</code></div>
 
+        <p v-if="st(e).status && st(e).body === null && !st(e).err" class="ac-muted">API trả về rỗng (data = null) — không có bảng để hiển thị.</p>
         <template v-if="st(e).body !== null">
           <!-- ledger view -->
-          <div v-if="e.ledger && rows(st(e))">
+          <div v-if="e.ledger && isJournalList(st(e))">
             <p v-if="!journals(st(e)).length" class="ac-muted">Không có bút toán khớp.</p>
             <div v-for="j in journals(st(e))" :key="j.id" class="ac-jr" @click="ctx.orderId = j.sourceType === 'PAYMENT_ORDER' ? String(j.sourceId) : ctx.orderId">
               <div><b>#{{ j.id }}</b> {{ j.eventType }} <span class="ac-muted">{{ j.sourceType }}:{{ j.sourceId }} · {{ j.occurredAt }}</span></div>

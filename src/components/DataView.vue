@@ -26,6 +26,7 @@ const flagClass = (k, v) => {
 <template>
   <div class="dv">
     <p v-if="Array.isArray(data) && !data.length" class="dv-empty">Danh sách rỗng</p>
+    <p v-else-if="isObj(data) && !entries.length" class="dv-empty">Đối tượng rỗng {}</p>
     <div v-else-if="isRows(data)" class="dv-scroll">
       <table class="dv-t">
         <thead><tr><th class="dv-i">#</th><th v-for="c in cols" :key="c" class="dv-h"><b>{{ c }}</b><span class="dv-d">({{ fieldDoc(c) }})</span></th></tr></thead>
