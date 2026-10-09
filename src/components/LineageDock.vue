@@ -40,7 +40,7 @@ function analyze(j) {
   const split = [];
   if (j.event_type === 'FULFILLMENT_RECOGNIZED' && dr > 0n) {
     const parts = [['Người bán nhận', sum('CREATOR_PAYABLE') + sum('MERCHANT_PAYABLE')], ['Phí sàn (hoa hồng)', sum('PLATFORM_COMMISSION_REVENUE')],
-      ['Thuế khấu trừ', sum('TAX_WITHHOLDING_PAYABLE')], ['Affiliate', sum('AFFILIATE_PAYABLE')]];
+      ['Thuế khấu trừ (VAT + TNCN)', sum('TAX_WITHHOLDING_PAYABLE') + sum('CREATOR_VAT_WITHHOLDING_PAYABLE') + sum('MERCHANT_VAT_WITHHOLDING_PAYABLE')], ['Affiliate', sum('AFFILIATE_PAYABLE')]];
     for (const [label, amt] of parts) split.push({ label, amt, pct: Number((amt * 10000n) / dr) / 100 });
     for (const r of findRates(snap)) {
       const actual = B(r.calculatedAmountVnd ?? r.amountVnd);

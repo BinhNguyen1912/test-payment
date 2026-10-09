@@ -1,4 +1,5 @@
 import { reactive } from 'vue';
+import { rates } from './lineage.js';
 
 const STORAGE_PREFIX = 'ct_payout_flow_';
 const DEFAULT_API_BASE = '/api/v1';
@@ -51,15 +52,18 @@ export function saveSettings() {
 //   2. The tester types an EXISTING login for roles the API cannot create (creator/merchant need eKYC + admin approval,
 //      staff roles need an admin). Sub-accounts and everything else are discovered with GET calls.
 // Only the client id (which app the role signs in as) is fixed per persona.
+// Fixed test accounts (seeded through the real API). Password comes from VITE_ACTOR_PASSWORD in .env.local (never in source).
 export const PERSONA_PRESETS = {
-  buyer: { clientId: 'user' },
-  creator: { clientId: 'creator' },
-  merchant: { clientId: 'merchant' },
-  approver: { clientId: 'user' },
-  executor: { clientId: 'user' },
-  reconciler: { clientId: 'user' },
-  affiliate: { clientId: 'user' },
+  buyer: { clientId: 'user', identifier: 'buyer.real@yopmail.com' },
+  creator: { clientId: 'creator', identifier: 'creator.real@yopmail.com' },
+  merchant: { clientId: 'merchant', identifier: 'merchant.real@yopmail.com' },
+  approver: { clientId: 'user', identifier: 'ketoan.duyet.real@yopmail.com' },
+  executor: { clientId: 'user', identifier: 'treasury.xuly.real@yopmail.com' },
+  reconciler: { clientId: 'user', identifier: 'ketoan.doisoat.real@yopmail.com' },
+  affiliate: { clientId: 'user', identifier: 'affiliate.real@yopmail.com' },
+  admin: { clientId: 'user' },
 };
+const PRESET_PASSWORD = import.meta.env?.VITE_ACTOR_PASSWORD || '';
 /** Random password satisfying the backend policy (upper, lower, digit, symbol); never persisted in source. */
 export function generatePassword() {
   const r = crypto.getRandomValues(new Uint32Array(3));
@@ -67,7 +71,7 @@ export function generatePassword() {
 }
 export const DEFAULT_PASSWORD = '';
 // Bump when presets change: stale saved identifiers/tokens are discarded once.
-const PRESET_VERSION = '7';
+const PRESET_VERSION = '8';
 const presetsOutdated = get('preset_version') !== PRESET_VERSION;
 
 function makeSession(key, label, defaultIdentifier, defaultClientId = 'user', description = '') {
@@ -79,8 +83,8 @@ function makeSession(key, label, defaultIdentifier, defaultClientId = 'user', de
     key,
     label,
     description,
-    identifier: get(`${key}_identifier`, ''),
-    password: get(`${key}_password`, ''),
+    identifier: get(`${key}_identifier`, preset.identifier || ''),
+    password: get(`${key}_password`, PRESET_PASSWORD),
     pin: '',
     clientId: get(`${key}_client_id`, preset.clientId),
     activeAccountUserId: get(`${key}_active_account_user_id`),
@@ -147,6 +151,13 @@ export const sessions = reactive({
     'user',
     'Referred the buyer; earns the listing affiliate share & requests payouts',
   ),
+  admin: makeSession(
+    'admin',
+    'Admin cấu hình tài chính',
+    '',
+    'user',
+    'Cần quyền FinanceConfigRead / FinanceConfigManage để xem và cấu hình thuế',
+  ),
 });
 
 set('preset_version', PRESET_VERSION);
@@ -155,9 +166,9 @@ set('preset_version', PRESET_VERSION);
 export function applyPreset(session) {
   const preset = PERSONA_PRESETS[session.key];
   if (!preset) return;
-  session.identifier = '';
+  session.identifier = preset.identifier || '';
   session.clientId = preset.clientId;
-  session.password = '';
+  session.password = PRESET_PASSWORD;
   saveSession(session);
   clearSession(session);
 }
@@ -410,12 +421,12 @@ export async function signIn(session) {
     let token = tokenFrom(response.data);
     setToken(session, token, response.data?.tokenType || 'Bearer');
 
-    if (response.data?.outcome === 'STEP_UP_REQUIRED') {
-      const takeover = await request(session, 'POST', '/mobile/auth/device/confirm-takeover', {
-        body: session.pin ? { pin: session.pin } : {},
-      });
-      token = tokenFrom(takeover.data) || token;
-      setToken(session, token, takeover.data?.tokenType || session.tokenType);
+    // BE sign-in outcome is 'PROCEED' | 'TWO_FACTOR_REQUIRED'. The old device takeover route
+    // (/mobile/auth/device/confirm-takeover) no longer exists, so 2FA accounts cannot be driven by this tester.
+    if (response.data?.outcome === 'TWO_FACTOR_REQUIRED') {
+      const error = new Error('Tài khoản bật 2FA (outcome TWO_FACTOR_REQUIRED): tester không tự vượt 2FA được. Tắt 2FA hoặc dùng tài khoản khác.');
+      error.code = 'TWO_FACTOR_REQUIRED';
+      throw error;
     }
 
     if (!session.accessToken) {
@@ -576,9 +587,29 @@ export async function previewVoucherRedemption(session, token) {
   });
 }
 
-export async function confirmVoucherRedemption(session, challengeId, payload = {}, idempotencyKey = uuid()) {
+/** Khôi phục trạng thái redemption khi mạng gián đoạn sau lệnh confirm. */
+export async function getMerchantRedemption(session, challengeId) {
+  return request(session, 'GET', `/mobile/vouchers/merchant/redemptions/${encodeURIComponent(challengeId)}`);
+}
+
+/**
+ * Hai contract tồn tại song song:
+ *  - cũ (trước TRUST-927, vd worktree trust-913): body { orderAmount, itemIds?, provider?, providerRef?, merchantOrderRef? },
+ *    gói voucher có applicability.minOrderAmount.
+ *  - mới (TRUST-927, develop): KHÔNG có body; gói voucher không còn applicability.
+ * Công tắc lưu ở localStorage; mặc định = contract mới (TRUST-927) vì worktree 913 đã merge develop.
+ */
+// Key v2: bỏ giá trị cũ đã lưu. Mặc định = contract TRUST-927 (không body) vì backend trust-913 đã merge develop.
+export const redeemContract = reactive({ legacyBody: get('redeem_legacy_body_v2', '0') === '1' });
+export function setRedeemLegacyBody(value) {
+  redeemContract.legacyBody = !!value;
+  set('redeem_legacy_body_v2', value ? '1' : '0');
+}
+
+export async function confirmVoucherRedemption(session, challengeId, payload, idempotencyKey = uuid()) {
   return request(session, 'POST', `/mobile/vouchers/merchant/redemptions/${encodeURIComponent(challengeId)}/confirm`, {
-    body: payload,
+    // payload = undefined => không gửi body (contract TRUST-927)
+    ...(payload && redeemContract.legacyBody ? { body: payload } : {}),
     headers: { 'Idempotency-Key': idempotencyKey },
   });
 }
@@ -620,14 +651,16 @@ export async function listMerchantPayouts(session, query = {}) {
   return request(session, 'GET', '/mobile/merchant/finance/payouts/me', { query });
 }
 
-export async function requestMerchantPayout(session, { amountVnd, idempotencyKey, pinToken }) {
+export async function requestMerchantPayout(session, { amountVnd, idempotencyKey, pinToken, pin }) {
   const amount = String(amountVnd ?? '').replace(/\D/g, '');
   const key = idempotencyKey || `payout-${uuid()}`;
+  // BE: @RequirePin(PAYOUT) on every managed payout request (the token is one-time).
+  const token = pinToken || (await getPinToken(session, 'PAYOUT', pin));
   return request(session, 'POST', '/mobile/merchant/finance/payouts', {
     body: { amountVnd: amount, idempotencyKey: key },
     headers: {
       'Idempotency-Key': key,
-      ...(pinToken ? { 'X-Pin-Token': pinToken } : {}),
+      'X-Pin-Token': token,
     },
   });
 }
@@ -651,25 +684,54 @@ export async function getMerchantBalance(session, pinToken) {
 }
 
 // ---------------------------------------------------------
-// Bank Accounts (Creator)
+// Bank Accounts (TRUST-867): the route AND the authorization depend on the acting role.
+//   root user  -> /mobile/bank-accounts            body.smartOtp {requestId, code} (purpose BANK_ACCOUNT_CHANGE)
+//   creator    -> /mobile/creator/bank-accounts    header X-Pin-Token (reason BANK_ACCOUNT_CHANGE)
+//   merchant   -> /mobile/merchant/bank-accounts   header X-Pin-Token (reason BANK_ACCOUNT_CHANGE; only on the final write)
+// Body of add/update: { bank: <6-digit BIN>, account, password, otp: <6-digit email OTP> }.
 // ---------------------------------------------------------
+export function bankAccountBase(session) {
+  if (session?.clientId === 'creator') return '/mobile/creator/bank-accounts';
+  if (session?.clientId === 'merchant') return '/mobile/merchant/bank-accounts';
+  return '/mobile/bank-accounts';
+}
+
+export async function listBanks() {
+  return request(null, 'GET', '/public/bank-accounts/banks', { auth: false });
+}
+
 export async function getMyBankAccount(session) {
-  return request(session, 'GET', '/mobile/bank-accounts/me');
+  return request(session, 'GET', `${bankAccountBase(session)}/me`);
 }
 
-export async function addBankAccount(session, bankData) {
-  return request(session, 'POST', '/mobile/bank-accounts', {
-    body: bankData,
-  });
+/** One-time X-Pin-Token for a sensitive action (PAYOUT, BANK_ACCOUNT_CHANGE, VIEW_BALANCE, ...). */
+export async function getPinToken(session, reason, pin) {
+  const value = String(pin || session?.pin || '');
+  if (!/^\d{6}$/.test(value)) {
+    const error = new Error('Cần PIN 6 số của tài khoản này (thiết lập PIN trước, rồi nhập vào ô PIN).');
+    error.code = 'PIN_REQUIRED_CLIENT';
+    throw error;
+  }
+  const verified = await verifyPin(session, value, reason);
+  return verified.data.pinToken;
 }
 
-export async function requestBankOtp(session) {
-  return request(session, 'POST', '/mobile/bank-accounts/sensitive-action/challenge');
+/** Sends the email OTP required by every bank-account mutation. Creator needs a PIN token here too; merchant does not. */
+export async function requestBankOtp(session, { pin } = {}) {
+  const headers = {};
+  if (session?.clientId === 'creator') headers['X-Pin-Token'] = await getPinToken(session, 'BANK_ACCOUNT_CHANGE', pin);
+  return request(session, 'POST', `${bankAccountBase(session)}/otp`, { headers });
 }
 
-export async function verifyBankOtp(session, challengeToken, code) {
-  return request(session, 'POST', '/mobile/bank-accounts/sensitive-action/verify', {
-    body: { challengeToken, code },
+/** Add (or update with method 'PATCH') a bank account. `smartOtp` is required for root users, `pin` for creator/merchant. */
+export async function addBankAccount(session, { bank, account, password, otp, smartOtp, pin, method = 'POST' }) {
+  const managed = session?.clientId === 'creator' || session?.clientId === 'merchant';
+  const headers = {};
+  if (managed) headers['X-Pin-Token'] = await getPinToken(session, 'BANK_ACCOUNT_CHANGE', pin);
+  const path = method === 'PATCH' ? `${bankAccountBase(session)}/me` : bankAccountBase(session);
+  return request(session, method, path, {
+    body: { bank, account, password: password ?? session?.password, otp, ...(smartOtp ? { smartOtp } : {}) },
+    headers,
   });
 }
 
@@ -692,14 +754,16 @@ export async function listCreatorPayouts(session, query = {}) {
   return request(session, 'GET', '/mobile/creator/finance/payouts/me', { query });
 }
 
-export async function requestCreatorPayout(session, { amountVnd, idempotencyKey }) {
+export async function requestCreatorPayout(session, { amountVnd, idempotencyKey, pinToken, pin }) {
   // The API takes money as a digit string (no float/precision loss), and the
   // header and body keys must be identical or it answers PAYOUT_IDEMPOTENCY_CONFLICT.
   const amount = String(amountVnd ?? '').replace(/\D/g, '');
   const key = idempotencyKey || `payout-${uuid()}`;
+  // BE: @RequirePin(PAYOUT) on every managed (creator/merchant) payout request; the token is one-time.
+  const token = pinToken || (await getPinToken(session, 'PAYOUT', pin));
   return request(session, 'POST', '/mobile/creator/finance/payouts', {
     body: { amountVnd: amount, idempotencyKey: key },
-    headers: { 'Idempotency-Key': key },
+    headers: { 'Idempotency-Key': key, 'X-Pin-Token': token },
   });
 }
 
@@ -739,11 +803,12 @@ export async function listAffiliatePayouts(session, query = {}) {
   return request(session, 'GET', '/mobile/finance/payouts/me', { query });
 }
 
-export async function requestAffiliatePayout(session, { amountVnd, idempotencyKey }) {
+export async function requestAffiliatePayout(session, { amountVnd, idempotencyKey, smartOtp }) {
   const amount = String(amountVnd ?? '').replace(/\D/g, '');
   const key = idempotencyKey || `payout-${uuid()}`;
+  // BE: root payout needs body.smartOtp {requestId, code} (purpose PAYOUT_CONFIRM bound to amountVnd + idempotencyKey).
   return request(session, 'POST', '/mobile/finance/payouts', {
-    body: { amountVnd: amount, idempotencyKey: key },
+    body: { amountVnd: amount, idempotencyKey: key, ...(smartOtp ? { smartOtp } : {}) },
     headers: { 'Idempotency-Key': key },
   });
 }
@@ -818,6 +883,16 @@ export async function getLedgerIntegrity(session) {
   return request(session, 'GET', '/web/admin/finance/ledger/integrity');
 }
 
+/** Payment <-> fulfillment <-> VNPay reconciliation report (FinancePaymentsRead). */
+export async function getPaymentReconciliation(session) {
+  return request(session, 'GET', '/web/admin/payments/reconciliation');
+}
+
+/** Audit trail of inbound VNPay callbacks (vnpay_ipn_logs). Query: txnRef, outcome, channel, cursor, limit<=50. */
+export async function listVnpayIpnLogs(session, query = {}) {
+  return request(session, 'GET', '/web/admin/payments/ipn-logs', { query });
+}
+
 export async function getFinanceJournals(session, query = {}) {
   return request(session, 'GET', '/web/admin/finance/ledger/journals', { query });
 }
@@ -846,8 +921,36 @@ export async function approveTreasurySettlement(session, id, { evidenceSource = 
 // ---------------------------------------------------------
 const TAX_EXPORT_BASE = '/web/admin/finance/tax-reports/withholding/exports';
 
-export async function requestTaxExport(session, { from, to }) {
-  return request(session, 'POST', TAX_EXPORT_BASE, { body: { from, to } });
+/** Preset enum (TRUST-913). Server resolves dates in VN time; the FE never computes them. */
+export const DATE_RANGE_PRESETS = [
+  { value: 'TODAY', label: 'Hôm nay' },
+  { value: 'YESTERDAY', label: 'Hôm qua' },
+  { value: 'THIS_WEEK', label: 'Tuần này' },
+  { value: 'LAST_WEEK', label: 'Tuần trước' },
+  { value: 'LAST_7_DAYS', label: '7 ngày qua' },
+  { value: 'THIS_MONTH', label: 'Tháng này' },
+  { value: 'LAST_MONTH', label: 'Tháng trước' },
+  { value: 'LAST_30_DAYS', label: '30 ngày qua' },
+  { value: 'THIS_QUARTER', label: 'Quý này' },
+  { value: 'LAST_QUARTER', label: 'Quý trước' },
+  { value: 'THIS_YEAR', label: 'Năm nay' },
+  { value: 'LAST_YEAR', label: 'Năm trước' },
+  { value: 'CUSTOM', label: 'Tự chọn' },
+];
+
+/** `from`/`to` are sent ONLY for CUSTOM; other presets must not carry them. */
+export async function requestTaxExport(session, { preset, from, to }) {
+  const body = { preset };
+  if (preset === 'CUSTOM') {
+    body.from = from;
+    body.to = to;
+  }
+  return request(session, 'POST', TAX_EXPORT_BASE, { body });
+}
+
+/** Sends an arbitrary body as-is. Only for contract tests (invalid bodies on purpose). */
+export async function requestTaxExportRaw(session, body) {
+  return request(session, 'POST', TAX_EXPORT_BASE, { body });
 }
 
 export async function getTaxExport(session, exportId) {
@@ -1185,4 +1288,66 @@ export async function loadLocalAccounts() {
     });
     return n;
   } catch { return 0; }
+}
+
+// ---------------------------------------------------------
+// Real fee / tax rates (admin read). develop (TRUST-912): 5 fixed seller groups, each with vatBps / pitBps / platformFeeBps.
+// Older branches only have revenue-sources/:id/policy-versions; used as a fallback when seller-policy-groups is 404.
+// ---------------------------------------------------------
+export function selectPolicyGroup(group) {
+  const g = rates.groups.find((x) => x.group === group);
+  if (!g?.current) return;
+  rates.group = group;
+  rates.feeBps = Number(g.current.platformFeeBps);
+  rates.vatBps = Number(g.current.vatBps);
+  rates.pitBps = Number(g.current.pitBps);
+  rates.taxBps = rates.vatBps + rates.pitBps;
+  rates.source = `seller-policy ${group} v${g.current.versionNo}`;
+}
+
+export async function loadPolicyRates(session, { group = 'CREATOR_INDIVIDUAL', sourceCodeHint = 'COMMITMENT' } = {}) {
+  try {
+    const res = await request(session, 'GET', '/web/admin/finance/seller-policy-groups');
+    rates.groups = (res.data?.items || res.data || []).map((x) => ({ group: x.group, current: x.current }));
+    if (rates.groups.some((g) => g.current)) {
+      selectPolicyGroup(group);
+      return rates;
+    }
+    // Table finance_seller_policy_versions exists but holds no row yet -> use the legacy policy tables below.
+  } catch (e) {
+    if (e.status !== 404 && e.code !== 'NOT_FOUND') throw e;
+  }
+  const list = await request(session, 'GET', '/web/admin/finance/revenue-sources', { query: { limit: 50 } });
+  const sources = list.data?.items || list.data || [];
+  if (!sources.length) throw new Error('BE không trả revenue source nào.');
+  const src = sources.find((x) => String(x.code).toUpperCase().includes(sourceCodeHint)) || sources[0];
+  const versions = await request(session, 'GET', `/web/admin/finance/revenue-sources/${src.id}/policy-versions`, { query: { limit: 20 } });
+  const items = versions.data?.items || versions.data || [];
+  const active = items.find((v) => v.status === 'ACTIVE') || [...items].sort((a, b) => b.versionNo - a.versionNo)[0];
+  if (!active) throw new Error(`Source ${src.code} chưa có policy version.`);
+  const pct = (l) => (l.valueType === 'PERCENT' ? Number(l.rateBps || 0) : 0);
+  rates.feeBps = active.lines.filter((l) => l.chargeKind === 'FEE').reduce((a, l) => a + pct(l), 0);
+  rates.taxBps = active.lines.filter((l) => l.chargeKind === 'TAX').reduce((a, l) => a + pct(l), 0);
+  rates.vatBps = 0; // legacy policy has a single tax line, shown as TNCN
+  rates.pitBps = rates.taxBps;
+  rates.groups = [];
+  rates.source = `${src.code} v${active.versionNo} (${active.status})`;
+  return rates;
+}
+
+// ---------------------------------------------------------
+// Seller tax / fee policy admin (TRUST-912). Versions are append-only and optimistic-locked by expectedVersionNo.
+// ---------------------------------------------------------
+export async function listSellerPolicyGroups(session) {
+  return request(session, 'GET', '/web/admin/finance/seller-policy-groups');
+}
+
+export async function listSellerPolicyVersions(session, group, query = { limit: 20 }) {
+  return request(session, 'GET', `/web/admin/finance/seller-policy-groups/${encodeURIComponent(group)}/versions`, { query });
+}
+
+export async function createSellerPolicyVersion(session, group, { expectedVersionNo, vatBps, pitBps, platformFeeBps, changeNote }) {
+  return request(session, 'POST', `/web/admin/finance/seller-policy-groups/${encodeURIComponent(group)}/versions`, {
+    body: { expectedVersionNo, vatBps, pitBps, platformFeeBps, changeNote },
+  });
 }

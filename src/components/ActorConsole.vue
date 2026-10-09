@@ -12,6 +12,7 @@ const adminKey = ref('approver');
 const ACTORS = { buyer: 'Người mua', merchant: 'Merchant', creator: 'Creator', admin: 'Admin / Kế toán' };
 const session = computed(() => sessions[actor.value === 'admin' ? adminKey.value : actor.value]);
 
+const queryString = (q) => new URLSearchParams(q).toString();
 const first = (...ks) => (r) => { for (const k of ks) if (r?.[k] !== undefined && r?.[k] !== null) return String(r[k]); return ''; };
 const E = (id, label, path, o = {}) => ({ id, label, method: 'GET', path, params: [], query: [], ...o });
 const LIMIT = { k: 'limit', label: 'limit', def: '20' };
@@ -233,7 +234,7 @@ watch([actor, adminKey], () => { info.blocks = []; info.at = ''; loadInfo(); });
           <span class="ac-muted">{{ st(e).at }}</span>
         </div>
         <p v-if="st(e).err" class="ac-err">{{ st(e).err }}</p>
-        <div v-if="st(e).sent && st(e).body !== null" class="ac-muted">Đã gọi: <code>{{ st(e).sent.path }}</code> <code v-if="Object.keys(st(e).sent.query).length">?{{ new URLSearchParams(st(e).sent.query).toString() }}</code></div>
+        <div v-if="st(e).sent && st(e).body !== null" class="ac-muted">Đã gọi: <code>{{ st(e).sent.path }}</code> <code v-if="Object.keys(st(e).sent.query).length">?{{ queryString(st(e).sent.query) }}</code></div>
 
         <p v-if="st(e).status && st(e).body === null && !st(e).err" class="ac-muted">API trả về rỗng (data = null) — không có bảng để hiển thị.</p>
         <template v-if="st(e).body !== null">

@@ -227,10 +227,13 @@ async function trace({ orderId, txnRef, userId }) {
          OR event_key ~ ('(^|:)PAYMENT_ORDER:(' || array_to_string($1::text[], '|') || ')$')
          OR (source_type = 'VOUCHER_REDEMPTION' AND source_id = ANY($2::text[]))
          OR (source_type ILIKE '%UNIT%' AND source_id = ANY($3::text[]))
+         OR event_key ~ ('(^|:)CART_CHECKOUT_UNIT:(' || array_to_string($3::text[], '|') || ')$')
+         OR (source_type ILIKE '%FULFILLMENT%' AND source_id = ANY($3::text[]))
+         OR id IN (SELECT journal_id FROM finance_journal_lines WHERE reference_type = 'PAYMENT_ORDER' AND reference_id = ANY($1::text[]))
       ORDER BY id`, [oid, rid, uid]);
     add('journals', 'finance_journals', '7. Bút toán (sổ kép)', 'PAYMENT_CAPTURED khi thu tiền; FULFILLMENT_RECOGNIZED khi ghi nhận doanh thu cho người bán. Mỗi bút toán có Σ Nợ = Σ Có.', journals);
     const jid = ids(journals);
-    const lines = await q(`SELECT l.*, a.code AS account_code, a.name AS account_name FROM finance_journal_lines l LEFT JOIN finance_accounts a ON a.id = l.account_id WHERE l.journal_id = ANY($1::bigint[]) ORDER BY l.journal_id, l.id`, [jid]);
+    const lines = await q(`SELECT l.*, a.code AS account_code, a.name AS account_name, a.vas_account_code, a.vas_account_name FROM finance_journal_lines l LEFT JOIN finance_accounts a ON a.id = l.account_id WHERE l.journal_id = ANY($1::bigint[]) ORDER BY l.journal_id, l.id`, [jid]);
     const pvIds = [...new Set([...journals.map((j) => j.policy_version_id), ...units.map((u) => u.finance_policy_version_id)].filter(Boolean).map(String))];
     add('policy', 'finance_policy_lines', '7b. Chính sách phí/thuế được áp dụng', 'Phiên bản chính sách tại thời điểm bán: tỷ lệ hoa hồng sàn, thuế khấu trừ, VAT… (rate_bps: 100 = 1%).', await q(`SELECT v.id AS policy_version_id, v.version_no, v.status, v.effective_from, s.code AS revenue_source, pl.charge_code, pl.charge_kind, pl.payer, pl.recipient, pl.basis, pl.value_type, pl.rate_bps, pl.fixed_amount_vnd FROM finance_policy_versions v JOIN finance_revenue_sources s ON s.id = v.revenue_source_id LEFT JOIN finance_policy_lines pl ON pl.policy_version_id = v.id WHERE v.id = ANY($1::bigint[]) ORDER BY v.id, pl.sort_order`, [pvIds]));
     add('lines', 'finance_journal_lines', '8. Các dòng Nợ/Có', 'Tiền đi từ tài khoản nào sang tài khoản nào, và thuộc bên nào (khách, VNPay, creator, merchant, sàn, thuế…).', lines);
@@ -248,6 +251,17 @@ async function trace({ orderId, txnRef, userId }) {
   });
 }
 
+// Recent orders straight from the DB (so every test case is selectable, not only the signed-in buyer's). Read-only.
+async function recentOrders({ limit = 60 } = {}) {
+  return ro(async (c) => {
+    const lim = Math.min(Number(limit) || 60, 200);
+    const { rows } = await c.query(`SELECT o.id, o.user_id, o.amount_vnd::text AS amount_vnd, o.status, o.fulfillment_status, o.purpose, o.created_at,
+        (SELECT count(*)::int FROM cart_checkout_units u WHERE u.payment_order_id = o.id) AS units
+      FROM payment_orders o ORDER BY o.id DESC LIMIT ${lim}`);
+    return { orders: rows };
+  });
+}
+
 // Everything the ledger holds for one party (user id): lines, hold state, payouts. Read-only.
 async function party({ partyId, limit = 50 }) {
   return ro(async (c) => {
@@ -255,10 +269,10 @@ async function party({ partyId, limit = 50 }) {
     const pid = String(partyId ?? '');
     if (!pid) return { error: 'partyId required' };
     const lim = Math.min(Number(limit) || 50, 100);
-    const lines = await q(`SELECT l.id AS line_id, l.journal_id, j.event_type, j.source_type, j.source_id, j.occurred_at, a.code AS account_code, l.side, l.amount_minor, l.party_type, l.party_id
+    const lines = await q(`SELECT l.id AS line_id, l.journal_id, j.event_type, j.source_type, j.source_id, j.occurred_at, a.code AS account_code, a.vas_account_code, a.vas_account_name, l.metadata, l.side, l.amount_minor, l.party_type, l.party_id
       FROM finance_journal_lines l JOIN finance_journals j ON j.id = l.journal_id LEFT JOIN finance_accounts a ON a.id = l.account_id
       WHERE l.party_id = $1 ORDER BY l.id DESC LIMIT ${lim}`, [pid]);
-    const balance = await q(`SELECT a.code AS account_code, l.party_type, SUM(CASE WHEN l.side='CREDIT' THEN l.amount_minor ELSE -l.amount_minor END)::text AS credit_minus_debit, COUNT(*)::int AS lines
+    const balance = await q(`SELECT a.code AS account_code, MAX(a.vas_account_code) AS vas_account_code, MAX(a.vas_account_name) AS vas_account_name, l.party_type, SUM(CASE WHEN l.side='CREDIT' THEN l.amount_minor ELSE -l.amount_minor END)::text AS credit_minus_debit, COUNT(*)::int AS lines
       FROM finance_journal_lines l LEFT JOIN finance_accounts a ON a.id = l.account_id WHERE l.party_id = $1 GROUP BY 1, 2 ORDER BY 1`, [pid]);
     const holds = await q('SELECT * FROM finance_holds WHERE party_id = $1 ORDER BY id DESC LIMIT 30', [pid]);
     const payouts = await q('SELECT * FROM finance_payouts WHERE party_id = $1 ORDER BY id DESC LIMIT 30', [pid]);
@@ -312,6 +326,7 @@ http.createServer(async (req, res) => {
       return send(res, 200, await collect(b.ticket, b));
     }
     if (req.method === 'POST' && url.pathname === '/lineage/trace') return send(res, 200, await trace(await readBody(req)));
+    if (req.method === 'POST' && url.pathname === '/lineage/orders') return send(res, 200, await recentOrders(await readBody(req)));
     if (req.method === 'POST' && url.pathname === '/lineage/party') return send(res, 200, await party(await readBody(req)));
     if (req.method === 'POST' && url.pathname === '/lineage/config') return send(res, 200, await config());
     if (req.method === 'POST' && url.pathname === '/lineage/reset') { Object.values(entities).forEach((s) => s.clear()); return send(res, 200, { ok: true }); }

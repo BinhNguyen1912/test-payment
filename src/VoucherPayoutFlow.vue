@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive } from 'vue';
 import {
   addBankAccount,
+  requestBankOtp,
   approvePayout,
   approveTreasurySettlement,
   claimPayoutProcessing,
@@ -187,11 +188,18 @@ async function ensureMerchantBankAccount() {
 
   const actingId = String(sessions.merchant.activeAccountUserId || sessions.merchant.profile?.id || '').replace(/\D/g, '');
   try {
+    // TRUST-867: a merchant bank write needs (1) email OTP requested first, (2) a one-time PIN token (BANK_ACCOUNT_CHANGE).
+    const pinStatus = await getPinStatus(sessions.merchant);
+    if (pinStatus.data?.status === 'NOT_CONFIGURED') {
+      await setupPin(sessions.merchant, sessions.merchant.password, state.merchantPin);
+    }
+    await requestBankOtp(sessions.merchant);
     const created = await addBankAccount(sessions.merchant, {
       bank: '970436',
       account: actingId.padStart(10, '0').slice(-10),
       password: sessions.merchant.password,
-      otp: '000000',
+      otp: '000000', // dev/staging bypass OTP; the real OTP is mailed by requestBankOtp
+      pin: state.merchantPin,
     });
     addLog('merchant-bank', 'ok', `provisioned local bank account #${created.data.id}`);
     return created.data;
@@ -331,9 +339,9 @@ function verifyAccounts() {
       ok:
         hasLine(recognition, 'CUSTOMER_FUNDS_HELD', 'DEBIT') &&
         hasLine(recognition, 'MERCHANT_PAYABLE', 'CREDIT') &&
-        hasLine(recognition, 'PLATFORM_COMMISSION_REVENUE', 'CREDIT') &&
-        hasLine(recognition, 'TAX_WITHHOLDING_PAYABLE', 'CREDIT'),
-      expected: 'Dr CUSTOMER_FUNDS_HELD / Cr MERCHANT_PAYABLE + commission + withholding tax',
+        hasLine(recognition, 'PLATFORM_COMMISSION_REVENUE', 'CREDIT'),
+      // Zero-rate tax lines (e.g. company seller) are not posted at all, so tax accounts are not asserted here.
+      expected: 'Dr CUSTOMER_FUNDS_HELD / Cr MERCHANT_PAYABLE + commission (+ VAT 3331 / PIT 3335 when the seller group rate > 0)',
     },
   ];
   if (state.payout?.id) {
@@ -432,19 +440,21 @@ async function runFullFlow() {
     const proof = await issueVoucherProof(state.voucher.publicId);
     const token = await createVoucherRedemptionToken(sessions.buyer, state.voucher.publicId, proof);
     const preview = await previewVoucherRedemption(sessions.merchant, token.data.token);
+    // Contract cũ cần orderAmount (+ itemIds nếu voucher giới hạn món); contract TRUST-927 không gửi body (api.js tự bỏ).
     const minimum = Number(selectedProduct.value.applicability?.minOrderAmount || 0);
     const orderAmount = String(Math.max(Number(selectedProduct.value.faceValue || 0), minimum, 1));
     const eligibleItems = selectedProduct.value.applicability?.eligibleItems || [];
+    const legacyPayload = {
+      orderAmount,
+      ...(eligibleItems.length ? { itemIds: [eligibleItems[0]] } : {}),
+      provider: 'LOCAL_FULL_FLOW_TEST',
+      providerRef: `voucher-${state.orderId}`,
+      merchantOrderRef: `merchant-order-${uuid()}`,
+    };
     const redemption = await confirmVoucherRedemption(
       sessions.merchant,
       preview.data.challengeId,
-      {
-        orderAmount,
-        ...(eligibleItems.length ? { itemIds: [eligibleItems[0]] } : {}),
-        provider: 'LOCAL_FULL_FLOW_TEST',
-        providerRef: `voucher-${state.orderId}`,
-        merchantOrderRef: `merchant-order-${uuid()}`,
-      },
+      legacyPayload,
       `redeem-${uuid()}`,
     );
     state.redemption = redemption.data;

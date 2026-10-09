@@ -256,7 +256,8 @@ body {
   align-items: center;
   gap: 8px;
   margin-bottom: 28px;
-  overflow-x: auto;
+  flex-wrap: wrap;
+  row-gap: 10px;
   padding-bottom: 8px;
 }
 
@@ -753,11 +754,18 @@ pre.code-block {
 #app-floating-dock #shop-root,
 #app-floating-dock #actor-console-root,
 #app-floating-dock #money-flow-root,
-#app-floating-dock #merchant-studio-root {
+#app-floating-dock #overview-flow-root,
+#app-floating-dock #merchant-studio-root,
+#app-floating-dock #recon-studio-root,
+#app-floating-dock #payrecon-root {
   display: contents;
 }
 
-.shop-fab, .ac-fab, .mf-fab, .ms-fab {
+#app-floating-dock #voucher-redeem-root {
+  display: contents;
+}
+
+.shop-fab, .ac-fab, .mf-fab, .ov-fab, .ms-fab, .rs-fab, .vr-fab {
   position: static !important;
   display: inline-flex !important;
   align-items: center !important;
@@ -813,6 +821,24 @@ pre.code-block {
   box-shadow: 0 6px 18px rgba(245, 158, 11, 0.45) !important;
 }
 
+.rs-fab {
+  background: linear-gradient(135deg, #0369a1, #0ea5e9) !important;
+}
+.rs-fab:hover {
+  background: linear-gradient(135deg, #075985, #0369a1) !important;
+  transform: translateY(-2px) scale(1.03) !important;
+  box-shadow: 0 6px 18px rgba(14, 165, 233, 0.45) !important;
+}
+
+.vr-fab {
+  background: linear-gradient(135deg, #be185d, #ec4899) !important;
+}
+.vr-fab:hover {
+  background: linear-gradient(135deg, #9d174d, #be185d) !important;
+  transform: translateY(-2px) scale(1.03) !important;
+  box-shadow: 0 6px 18px rgba(236, 72, 153, 0.45) !important;
+}
+
 .shop-badge {
   background: #ffffff !important;
   color: #4f46e5 !important;
@@ -823,3 +849,5 @@ pre.code-block {
 }
 
 
+
+.tbl-tag { margin-left: 8px; background: #eef2ff; color: #3730a3; padding: 1px 6px; border-radius: 4px; font-size: 0.68rem; font-weight: 400; }

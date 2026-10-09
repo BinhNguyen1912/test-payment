@@ -50,7 +50,7 @@ const normalizers = {
   COMMITMENT: (i) => ({
     kind: 'COMMITMENT',
     id: String(i.id),
-    productId: String(i.templateId || ''),
+    productId: String(i.commitment?.templateId || i.templateId || ''),
     title: i.title,
     owner: i.creatorName || (i.creatorId ? `Creator ${i.creatorId}` : '—'),
     ownerId: i.creatorId,

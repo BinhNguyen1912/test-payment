@@ -10,8 +10,12 @@
 // Entries flagged source:'expected' are computed from the policy (10% fee / 7% tax /
 // affiliate bps); attachLedger() swaps them for the journals really posted.
 
-export const PLATFORM_FEE_BPS = 1000;
-export const WITHHOLDING_TAX_BPS = 700;
+import { reactive } from 'vue';
+
+// Fallback only. loadPolicyRates() (api.js) replaces these with the ACTIVE policy version read from the BE
+// (GET /web/admin/finance/revenue-sources/:id/policy-versions), so estimates follow whatever the DB really holds.
+// vatBps -> CREATOR/MERCHANT_VAT_WITHHOLDING_PAYABLE (3331), pitBps -> TAX_WITHHOLDING_PAYABLE (3335); taxBps = vatBps + pitBps.
+export const rates = reactive({ feeBps: 1000, vatBps: 500, pitBps: 500, taxBps: 1000, source: 'mặc định seed của code (chưa tải từ BE)', group: '', groups: [] });
 
 export const PURPOSE = {
   COMMITMENT: 'COMMITMENT_TEMPLATE_PURCHASE',
@@ -51,13 +55,17 @@ function bps(amount, rate) {
 /** Gross -> creator/merchant net, platform fee, withholding tax and affiliate share. */
 export function computeSplit(gross, affiliateBps = 0) {
   const g = digits(gross);
-  const fee = bps(g, PLATFORM_FEE_BPS);
-  const tax = bps(g, WITHHOLDING_TAX_BPS);
+  const fee = bps(g, rates.feeBps);
+  const vat = bps(g, rates.vatBps);
+  const pit = bps(g, rates.pitBps);
+  const tax = vat + pit;
   const affiliate = bps(g, Number(affiliateBps) || 0);
   return {
     gross: g.toString(),
     fee: fee.toString(),
     tax: tax.toString(),
+    vat: vat.toString(),
+    pit: pit.toString(),
     affiliate: affiliate.toString(),
     net: (g - fee - tax - affiliate).toString(),
   };
@@ -175,10 +183,12 @@ export function fulfillmentEntry({ kind, amount, orderId, affiliateBps = 0 }) {
   const isVoucher = kind === 'VOUCHER';
   const payable = isVoucher ? 'MERCHANT_PAYABLE' : 'CREATOR_PAYABLE';
   const credits = [
-    line(payable, s.net, `${+(100 - (PLATFORM_FEE_BPS + WITHHOLDING_TAX_BPS + Number(affiliateBps || 0)) / 100).toFixed(2)}%`),
-    line('PLATFORM_COMMISSION_REVENUE', s.fee, '10%'),
-    line('TAX_WITHHOLDING_PAYABLE', s.tax, '7%'),
+    line(payable, s.net, `${+(100 - (rates.feeBps + rates.taxBps + Number(affiliateBps || 0)) / 100).toFixed(2)}%`),
+    line('PLATFORM_COMMISSION_REVENUE', s.fee, `${rates.feeBps / 100}%`),
   ];
+  // The BE posts a tax line only when its rate is > 0 (zero-rate lines are never emitted).
+  if (BigInt(s.vat) > 0n) credits.push(line(isVoucher ? 'MERCHANT_VAT_WITHHOLDING_PAYABLE' : 'CREATOR_VAT_WITHHOLDING_PAYABLE', s.vat, `VAT ${rates.vatBps / 100}%`));
+  if (BigInt(s.pit) > 0n) credits.push(line('TAX_WITHHOLDING_PAYABLE', s.pit, `TNCN ${rates.pitBps / 100}%`));
   if (BigInt(s.affiliate) > 0n) credits.push(line('AFFILIATE_PAYABLE', s.affiliate, `${(Number(affiliateBps) / 100).toFixed(2)}%`));
   return {
     event: isVoucher ? '2. Redeem voucher / Khớp lệnh' : '2. Giao hàng / Khớp lệnh',

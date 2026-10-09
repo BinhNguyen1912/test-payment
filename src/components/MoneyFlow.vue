@@ -3,6 +3,7 @@ import { fieldDoc } from '../fieldDocs.js';
 import { computed, onBeforeUnmount, reactive, ref } from 'vue';
 import { request, sessions } from '../api.js';
 import { ctx, presets, addPreset } from '../ctxStore.js';
+import TaxConfigEditor from './TaxConfigEditor.vue';
 
 // Money-flow tracker. Reads the real DB tables (read-only, through the lineage server) so nobody has to open the DB.
 // Two views: follow ONE ORDER through every table, or look at everything the ledger holds for ONE PARTY (user/sub-account id).
@@ -103,11 +104,11 @@ const ACC_DOC = {
   CREATOR_PAYABLE: { grp: 'Sàn nợ ai', what: 'Số tiền sàn còn nợ Creator từ việc bán thẻ cam kết.', up: 'Tăng khi thẻ cam kết được ghi nhận (phần creator sau phí & thuế).', down: 'Giảm khi creator rút tiền.', read: (n) => `Sàn nợ các creator tổng cộng ${money(n)}₫ (chưa rút).` },
   AFFILIATE_PAYABLE: { grp: 'Sàn nợ ai', what: 'Hoa hồng giới thiệu sàn còn nợ người giới thiệu (affiliate).', up: 'Tăng khi đơn có affiliate được ghi nhận.', down: 'Giảm khi affiliate rút tiền.', read: (n) => `Sàn nợ affiliate ${money(n)}₫ hoa hồng.` },
   PAYOUT_IN_TRANSIT: { grp: 'Sàn nợ ai', what: 'Tiền rút đã được duyệt/gửi ngân hàng nhưng chưa xác nhận đã chuyển xong.', up: 'Tăng khi lệnh rút được gửi đi.', down: 'Giảm khi ngân hàng xác nhận thành công.', read: (n) => `${money(n)}₫ đang trên đường chuyển cho người rút tiền.` },
-  PLATFORM_COMMISSION_REVENUE: { grp: 'Doanh thu của sàn', what: 'Phí/hoa hồng sàn thu từ người bán (mặc định 10%).', up: 'Tăng mỗi lần ghi nhận doanh thu cho người bán.', down: 'Gần như không giảm.', read: (n) => `Sàn đã kiếm được ${money(n)}₫ tiền hoa hồng.` },
+  PLATFORM_COMMISSION_REVENUE: { grp: 'Doanh thu của sàn', what: 'Phí/hoa hồng sàn thu từ người bán (tỉ lệ lấy từ policy nhóm người bán, seed mặc định 10%).', up: 'Tăng mỗi lần ghi nhận doanh thu cho người bán.', down: 'Gần như không giảm.', read: (n) => `Sàn đã kiếm được ${money(n)}₫ tiền hoa hồng.` },
   MARKETPLACE_FEE_REVENUE: { grp: 'Doanh thu của sàn', what: 'Phí marketplace (loại phí riêng).', up: 'Tăng khi có phí marketplace.', down: '—', read: (n) => (n === 0n ? 'Chưa phát sinh (0).' : `${money(n)}₫.`) },
   MEMBERSHIP_DEFERRED_REVENUE: { grp: 'Doanh thu của sàn', what: 'Tiền bán thẻ thành viên đã thu nhưng dịch vụ chưa dùng hết (chưa được tính là doanh thu). Mã kế toán 3387.', up: 'Tăng khi khách mua gói thành viên (trừ phần VAT).', down: 'Giảm dần theo từng tháng khi chuyển sang doanh thu (job cuối tháng).', read: (n) => `Còn ${money(n)}₫ tiền thành viên chờ chuyển thành doanh thu theo từng tháng.` },
   MEMBERSHIP_REVENUE: { grp: 'Doanh thu của sàn', what: 'Doanh thu thành viên đã được ghi nhận. Mã 5113.', up: 'Tăng mỗi tháng khi job chuyển từ 3387 sang.', down: '—', read: (n) => (n === 0n ? 'Chưa có tháng nào được ghi nhận (job cuối tháng chưa chạy).' : `Đã ghi nhận ${money(n)}₫ doanh thu thành viên.`) },
-  TAX_WITHHOLDING_PAYABLE: { grp: 'Thuế phải nộp', what: 'Thuế khấu trừ (mặc định 7%) sàn giữ lại từ tiền của người bán để nộp nhà nước.', up: 'Tăng mỗi lần ghi nhận doanh thu cho người bán.', down: 'Chỉ giảm khi sàn nộp thuế — hiện backend CHƯA có bước nộp thuế nên chỉ tăng.', read: (n) => `Sàn đang giữ ${money(n)}₫ thuế khấu trừ chưa nộp.` },
+  TAX_WITHHOLDING_PAYABLE: { grp: 'Thuế phải nộp', what: 'Thuế khấu trừ (tỉ lệ do bảng policy trong DB quyết định; dev DB hiện tại: SELLER_WITHHOLDING_TAX 7%) sàn giữ lại từ tiền của người bán để nộp nhà nước.', up: 'Tăng mỗi lần ghi nhận doanh thu cho người bán.', down: 'Chỉ giảm khi sàn nộp thuế — hiện backend CHƯA có bước nộp thuế nên chỉ tăng.', read: (n) => `Sàn đang giữ ${money(n)}₫ thuế khấu trừ chưa nộp.` },
   VAT_OUTPUT_PAYABLE: { grp: 'Thuế phải nộp', what: 'VAT đầu ra (8%/10%) nằm trong giá bán thẻ thành viên, sàn phải nộp nhà nước.', up: 'Tăng khi bán gói thành viên.', down: 'Chỉ giảm khi nộp VAT — hiện chưa có bước nộp.', read: (n) => `Sàn đang giữ ${money(n)}₫ VAT chưa nộp.` },
   PAYMENT_GATEWAY_FEE_EXPENSE: { grp: 'Chi phí', what: 'Phí cổng thanh toán VNPay sàn phải trả.', up: 'Tăng khi ghi nhận phí VNPay lúc đối soát.', down: '—', read: (n) => (n === 0n ? 'Chưa ghi nhận chi phí VNPay nào (0).' : `${money(-n)}₫ chi phí.`) },
   PAYOUT_BANK_FEE_EXPENSE: { grp: 'Chi phí', what: 'Phí ngân hàng khi chuyển tiền rút.', up: 'Tăng khi có phí chuyển khoản.', down: '—', read: (n) => (n === 0n ? 'Chưa phát sinh (0).' : `${money(-n)}₫ chi phí.`) },
@@ -231,6 +232,7 @@ const json = (v) => JSON.stringify(v, null, 2);
     </div>
 
     <!-- CONFIG / TAX / ACCOUNTS -->
+    <div v-if="mode === 'config'" class="mf-body"><TaxConfigEditor /></div>
     <div v-if="mode === 'config' && conf" class="mf-body">
       <section class="mf-stage"><div class="mf-sh"><b>Sổ tài khoản (bảng cân đối thử)</b> <code>finance_accounts + finance_journal_lines</code>
         <span v-if="conf.trial" :class="['mf-pill', conf.trial.debit === conf.trial.credit ? 'mf-g' : 'mf-y']">Σ Nợ {{ money(conf.trial.debit) }} {{ conf.trial.debit === conf.trial.credit ? '=' : '≠' }} Σ Có {{ money(conf.trial.credit) }}</span></div>

@@ -1,6 +1,6 @@
 <script setup>
 import { computed, reactive, ref } from 'vue';
-import { request, sessions, signIn, uuid, getSmartOtpStatus, initSmartOtpEnrollment, confirmSmartOtpEnrollment, issueSmartOtpChallenge, issueSmartOtpCode,
+import { redeemContract, setRedeemLegacyBody, request, sessions, signIn, uuid, getSmartOtpStatus, initSmartOtpEnrollment, confirmSmartOtpEnrollment, issueSmartOtpChallenge, issueSmartOtpCode,
   requestVoucherRedemptionAuthorization, createVoucherRedemptionToken, previewVoucherRedemption, confirmVoucherRedemption } from '../api.js';
 import { generateDeviceKeyPair, signWithDeviceKey } from '../crypto.js';
 import { ctx } from '../ctxStore.js';
@@ -37,7 +37,7 @@ const dto = computed(() => ({
     };
     ['subtitle', 'description', 'termsAndConditions', 'usageInstructions', 'publicCode'].forEach((k) => { if (str(p[k])) o[k] = p[k]; });
     ['validFrom', 'validUntil', 'purchaseStartsAt', 'purchaseEndsAt'].forEach((k) => { if (str(p[k])) o[k] = new Date(p[k]).toISOString(); });
-    if (num(p.minOrderAmount)) o.applicability = { minOrderAmount: num(p.minOrderAmount) };
+    if (redeemContract.legacyBody && num(p.minOrderAmount)) o.applicability = { minOrderAmount: num(p.minOrderAmount) };
     if (num(p.affiliateShareBps)) o.affiliateShareBps = num(p.affiliateShareBps);
     return o;
   }),
@@ -83,13 +83,13 @@ const SK = 'merchant_studio_smartotp_v1';
 const dev = reactive({ deviceId: '', publicKey: '', privateKeyBase64: '', pin: '', attestation: '', ...JSON.parse(localStorage.getItem(SK) || '{}') });
 const saveDev = () => localStorage.setItem(SK, JSON.stringify({ ...dev }));
 const wallet = ref([]);
+const rd = reactive({ orderAmount: '', itemIds: '', merchantOrderRef: '', providerRef: '' });
 const sel = ref(null);
 const otpStatus = ref(null);
 const tok = reactive({ token: '', expiresAt: '' });
 const prev = ref(null);
 const done = ref(null);
 const tokenIn = ref('');
-const rd = reactive({ orderAmount: '', itemIds: '', merchantOrderRef: '', providerRef: '' });
 const merchantEarn = ref(null);
 
 const loginBuyer = () => guard(async () => { await signIn(b); await loadWallet(); });
@@ -103,18 +103,55 @@ const enrollOtp = () => guard(async () => {
   const st = (await call(b, 'Trạng thái Smart OTP', 'GET', '/mobile/smart-otp/status')).data || {};
   otpStatus.value = st;
   if (st.deviceEnrolled) {
-    if (st.device?.deviceId !== dev.deviceId || !dev.privateKeyBase64) throw new Error(`Tài khoản này đã có thiết bị Smart OTP ${st.device?.deviceId || ''} nhưng trình duyệt không giữ khoá. Cần thu hồi thiết bị đó (hoặc dùng đúng trình duyệt đã đăng ký).`);
+    if (st.device?.deviceId !== dev.deviceId || !dev.privateKeyBase64) throw new Error(`Tài khoản này đã có thiết bị Smart OTP ${st.device?.deviceId || ''} nhưng trình duyệt không giữ khoá. Dùng khung "Khôi phục thiết bị" bên dưới (OTP gửi qua email/Zalo) hoặc dùng đúng trình duyệt đã đăng ký.`);
     return;
   }
+  await enrollNew({ deviceId: `studio-${uuid()}` });
+});
+
+// Đăng ký thiết bị mới. recoveryToken chỉ cần khi đăng ký lại sau khi đã thu hồi thiết bị cũ.
+async function enrollNew({ deviceId, recoveryToken }) {
   const pair = await generateDeviceKeyPair();
-  dev.publicKey = pair.publicKey; dev.privateKeyBase64 = pair.privateKeyBase64; dev.deviceId = `studio-${uuid()}`; dev.attestation = `dev-attestation-${uuid()}`.padEnd(40, 'x');
+  dev.publicKey = pair.publicKey; dev.privateKeyBase64 = pair.privateKeyBase64; dev.deviceId = deviceId; dev.attestation = `dev-attestation-${uuid()}`.padEnd(40, 'x');
   if (!/^\d{6}$/.test(dev.pin)) dev.pin = String(Math.floor(100000 + Math.random() * 900000));
   const init = await call(b, 'Smart OTP: bắt đầu đăng ký thiết bị', 'POST', '/mobile/smart-otp/enroll/init', { body: {
     password: b.password, deviceId: dev.deviceId, platform: 'ios', publicKey: dev.publicKey, keyAttestation: dev.attestation, hardwareInfo: navigator.userAgent,
+    ...(recoveryToken ? { recoveryToken } : {}),
     integrity: { isRooted: false, isEmulator: false, isHooked: false, isDebuggerAttached: false, isAppTampered: false } } });
   const signature = await signWithDeviceKey(dev.privateKeyBase64, init.data.challenge);
   await call(b, 'Smart OTP: xác nhận đăng ký (PIN)', 'POST', '/mobile/smart-otp/enroll/confirm', { body: { enrollmentId: init.data.enrollmentId, signature, pin: dev.pin } });
   saveDev(); await refreshOtp();
+}
+
+// Khôi phục khi mất khoá: REQUEST_OTP (gửi OTP) -> REVOKE (thu hồi + nhận recoveryToken) -> đăng ký thiết bị mới.
+const rec = reactive({ otp: '', sent: false, channel: '' });
+const recoverRequestOtp = () => guard(async () => {
+  const r = await call(b, 'Smart OTP: xin OTP khôi phục', 'POST', '/mobile/smart-otp/revoke', { body: { action: 'REQUEST_OTP', password: b.password } });
+  rec.sent = true; rec.channel = r.data?.channel || '';
+});
+const DEV_OTP = '000000'; // bypass cố định của backend dev/staging; KHÔNG dùng cho production
+const isDev = import.meta.env.DEV;
+const recoverAuto = () => guard(async () => {
+  // Bước 1: REQUEST_OTP, phải otpSent === true mới đi tiếp.
+  const r1 = await call(b, 'Smart OTP: xin OTP khôi phục (bước 1/2)', 'POST', '/mobile/smart-otp/revoke', { body: { action: 'REQUEST_OTP', password: b.password } });
+  if (!r1.data?.otpSent) throw new Error('Backend không xác nhận đã gửi OTP (otpSent != true).');
+  rec.sent = true; rec.channel = r1.data?.channel || '';
+  // Bước 2: REVOKE với OTP dev, nhận recoveryToken rồi đăng ký thiết bị mới.
+  const newDeviceId = `studio-${uuid()}`;
+  const r2 = await call(b, 'Smart OTP: thu hồi thiết bị cũ (bước 2/2)', 'POST', '/mobile/smart-otp/revoke', { body: { action: 'REVOKE', password: b.password, otp: DEV_OTP, newDeviceId } });
+  if (!r2.data?.recoveryToken) throw new Error('Backend không trả recoveryToken.');
+  dev.pin = '';
+  await enrollNew({ deviceId: newDeviceId, recoveryToken: r2.data.recoveryToken });
+  rec.otp = ''; rec.sent = false;
+});
+const recoverRevoke = () => guard(async () => {
+  if (!/^\d{6}$/.test(rec.otp)) throw new Error('OTP phải gồm 6 chữ số.');
+  const newDeviceId = `studio-${uuid()}`;
+  const r = await call(b, 'Smart OTP: thu hồi thiết bị cũ', 'POST', '/mobile/smart-otp/revoke', { body: { action: 'REVOKE', password: b.password, otp: rec.otp, newDeviceId } });
+  if (!r.data?.recoveryToken) throw new Error('Backend không trả recoveryToken.');
+  dev.pin = '';
+  await enrollNew({ deviceId: newDeviceId, recoveryToken: r.data.recoveryToken });
+  rec.otp = ''; rec.sent = false;
 });
 const makeToken = () => guard(async () => {
   if (!sel.value) throw new Error('Chọn một voucher trong ví trước.');
@@ -131,9 +168,12 @@ const previewTok = () => guard(async () => {
   if (!rd.orderAmount) rd.orderAmount = String(Math.round(Number(prev.value.amount)));
 });
 const confirmRd = () => guard(async () => {
-  const body = { orderAmount: rd.orderAmount, ...(rd.itemIds.trim() ? { itemIds: rd.itemIds.split(',').map((x) => x.trim()).filter(Boolean) } : {}),
-    provider: 'MERCHANT_STUDIO', ...(rd.providerRef ? { providerRef: rd.providerRef } : {}), ...(rd.merchantOrderRef ? { merchantOrderRef: rd.merchantOrderRef } : {}) };
-  done.value = (await call(m, 'Merchant: xác nhận redeem', 'POST', `/mobile/vouchers/merchant/redemptions/${prev.value.challengeId}/confirm`, { body, headers: { 'Idempotency-Key': uuid() } })).data;
+  // Contract cũ: body { orderAmount, itemIds?, provider, providerRef?, merchantOrderRef? }. Contract TRUST-927: không body.
+  const body = redeemContract.legacyBody
+    ? { orderAmount: rd.orderAmount, ...(rd.itemIds.trim() ? { itemIds: rd.itemIds.split(',').map((x) => x.trim()).filter(Boolean) } : {}),
+      provider: 'MERCHANT_STUDIO', ...(rd.providerRef ? { providerRef: rd.providerRef } : {}), ...(rd.merchantOrderRef ? { merchantOrderRef: rd.merchantOrderRef } : {}) }
+    : undefined;
+  done.value = (await call(m, 'Merchant: xác nhận redeem', 'POST', `/mobile/vouchers/merchant/redemptions/${prev.value.challengeId}/confirm`, { ...(body ? { body } : {}), headers: { 'Idempotency-Key': uuid() } })).data;
   ctx.voucherId = done.value.voucherId;
   await loadWallet(); await loadEarn();
 });
@@ -182,7 +222,7 @@ const margin = (p) => Number(p.faceValue) - Number(p.salePrice);
           <div class="ms-row">
             <template v-if="p.voucherType === 'DISCOUNT_PERCENT'"><label>Giảm %*<input v-model="p.percentage" type="number" class="ms-s" /></label><label>Tối đa (₫)<input v-model="p.maxAmount" type="number" /></label></template>
             <label v-else>Giảm (₫)*<input v-model="p.amount" type="number" /></label>
-            <label>Đơn tối thiểu (₫)<input v-model="p.minOrderAmount" type="number" /></label>
+            <label v-if="redeemContract.legacyBody">Đơn tối thiểu (₫)<input v-model="p.minOrderAmount" type="number" /></label>
             <label>Mệnh giá*<input v-model="p.faceValue" type="number" /></label>
             <label>Giá bán*<input v-model="p.salePrice" type="number" /></label>
             <label>Số lượng*<input v-model="p.maxSupply" type="number" class="ms-s" /></label>
@@ -225,6 +265,7 @@ const margin = (p) => Number(p.faceValue) - Number(p.salePrice);
 
       <section class="ms-card ms-wide">
         <h3>4. Redeem voucher <code>người mua cấp token → merchant quét/nhập → xác nhận</code></h3>
+        <label class="ms-mut"><input type="checkbox" :checked="redeemContract.legacyBody" @change="setRedeemLegacyBody($event.target.checked)" /> Backend dùng contract cũ (confirm có body orderAmount…). Bỏ chọn nếu backend đã có TRUST-927.</label>
         <p class="ms-mut">Redeem là lúc <b>ghi nhận doanh thu</b>: tiền rời CUSTOMER_FUNDS_HELD chia vào MERCHANT_PAYABLE / phí sàn / thuế (journal FULFILLMENT_RECOGNIZED). Xem kết quả ở 💸 Dòng tiền.</p>
         <div class="ms-two">
           <div class="ms-box"><h4>A. Người mua <span class="ms-mut">({{ b.identifier || 'chưa có' }})</span></h4>
@@ -235,6 +276,14 @@ const margin = (p) => Number(p.faceValue) - Number(p.salePrice);
             <p v-else class="ms-mut">Ví trống (voucher mua xong mới có, trạng thái ACTIVE).</p>
             <div class="ms-row"><button :disabled="!b.accessToken || busy" @click="enrollOtp">Chuẩn bị Smart OTP (đăng ký thiết bị)</button>
               <span class="ms-mut">PIN Smart OTP: <b>{{ dev.pin || '(tạo ngẫu nhiên khi đăng ký)' }}</b> · thiết bị {{ otpStatus?.deviceEnrolled ? 'đã đăng ký' : 'chưa đăng ký' }}</span></div>
+            <div v-if="otpStatus?.deviceEnrolled && !dev.privateKeyBase64" class="ms-detail">
+              <b>Khôi phục thiết bị</b> <span class="ms-mut">Trình duyệt này không giữ khoá của thiết bị {{ otpStatus.device?.deviceId }}. Thu hồi nó rồi đăng ký thiết bị mới (PIN mới tự sinh). Backend dev/staging: nếu kênh OTP là <b>zalo</b> thì nhập <b>000000</b> (bỏ qua gửi thật); kênh email thì phải dùng mã thật.</span>
+              <div v-if="isDev" class="ms-row"><button class="ms-go" :disabled="!b.accessToken || busy" @click="recoverAuto">Thu hồi thiết bị cũ &amp; đăng ký mới (tự động, OTP dev 000000)</button>
+                <span class="ms-mut">Tự gọi REQUEST_OTP rồi REVOKE. Chỉ có ở bản dev.</span></div>
+              <div class="ms-row"><button :disabled="!b.accessToken || busy" @click="recoverRequestOtp">1. Gửi OTP khôi phục</button>
+                <label>OTP 6 số {{ rec.channel ? '(qua ' + rec.channel + ')' : '' }}<input v-model="rec.otp" class="ms-s" maxlength="6" /></label>
+                <button class="ms-go" :disabled="!b.accessToken || busy || rec.otp.length !== 6" @click="recoverRevoke">2. Thu hồi &amp; đăng ký thiết bị mới</button></div>
+            </div>
             <div class="ms-row"><button class="ms-go" :disabled="!sel || !dev.privateKeyBase64 || busy" @click="makeToken">Tạo token redeem cho voucher #{{ sel?.id || '…' }}</button></div>
             <div v-if="tok.token" class="ms-token"><span>{{ tok.token }}</span><small>{{ left > 0 ? `còn ${left}s` : 'đã hết hạn — tạo lại' }}</small></div>
           </div>
@@ -242,9 +291,12 @@ const margin = (p) => Number(p.faceValue) - Number(p.salePrice);
             <div class="ms-row"><label>Token (8 ký tự)<input v-model="tokenIn" class="ms-w" placeholder="gõ tay hoặc lấy từ người mua" /></label>
               <button :disabled="!m.accessToken || !tokenIn || busy" @click="previewTok">Xem trước</button></div>
             <div v-if="prev" class="ms-detail"><b>{{ prev.productName }}</b> · {{ money(prev.amount) }} {{ prev.currency }} · chủ voucher: {{ prev.owner?.displayName || prev.owner?.id }} · challenge #{{ prev.challengeId }} · hết hạn {{ prev.expiresAt }}</div>
-            <div class="ms-row"><label>Giá trị đơn tại quầy (₫)<input v-model="rd.orderAmount" type="number" /></label><label>Mã món (cách nhau dấu phẩy)<input v-model="rd.itemIds" /></label>
-              <label>Mã đơn merchant<input v-model="rd.merchantOrderRef" /></label></div>
-            <p class="ms-mut">Giá trị đơn dùng để kiểm tra đơn tối thiểu; món chỉ cần khi voucher giới hạn món áp dụng.</p>
+            <template v-if="redeemContract.legacyBody">
+              <div class="ms-row"><label>Giá trị đơn tại quầy (₫)<input v-model="rd.orderAmount" type="number" /></label><label>Mã món (cách nhau dấu phẩy)<input v-model="rd.itemIds" /></label>
+                <label>Mã đơn merchant<input v-model="rd.merchantOrderRef" /></label></div>
+              <p class="ms-mut">Giá trị đơn dùng để kiểm tra đơn tối thiểu; món chỉ cần khi voucher giới hạn món áp dụng.</p>
+            </template>
+            <p v-else class="ms-mut">Contract TRUST-927: xác nhận redeem không cần body.</p>
             <div class="ms-row"><button class="ms-go" :disabled="!prev || busy" @click="confirmRd">Xác nhận redeem</button></div>
             <div v-if="done" class="ms-detail ms-ok2"><b>Redeem #{{ done.redemptionId }} {{ done.status }}</b> · voucher {{ done.voucherId }} · {{ money(done.amount) }} {{ done.currency }} · {{ done.redeemedAt }}
               <div class="ms-row"><a class="ms-link" :href="'#money&party=' + (m.activeAccountUserId || '')" target="_blank">Xem tiền của merchant →</a>

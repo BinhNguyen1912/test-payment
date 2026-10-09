@@ -7,7 +7,7 @@ A dedicated, visual end-to-end testing application built with Vue 3 and Vite for
 - **Full Client ID Selector**: Supports selecting `user`, `creator`, `merchant`, `admin` or custom Client IDs for each test persona.
 - **Commitment Template Purchase**: Select listings, create VNPay pending payment orders.
 - **VNPay Simulation**: Sandbox checkout redirect link + copyable local simulation CLI command + real-time status polling.
-- **Creator Wallet Balances**: Real-time inspection of Ledger-derived balances (`payable`, `available`, `held`, `pendingPayout`, `inTransit`) and source-level earnings breakdown (Gross, 10% Platform Commission, 7% Withholding Tax, Net).
+- **Creator Wallet Balances**: Real-time inspection of Ledger-derived balances (`payable`, `available`, `held`, `pendingPayout`, `inTransit`) and source-level earnings breakdown (Gross, Platform Commission, Withholding Tax, Net — rates are read from the active finance policy, not hard-coded).
 - **Creator Bank & Payout Request**: Register bank accounts and submit manual payout requests with idempotency keys.
 - **Accounting Approval Workflow**:
   - **Approver**: Reviews requested payouts and reserves ledger funds.

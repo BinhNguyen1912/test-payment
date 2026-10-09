@@ -33,9 +33,6 @@ import {
   requestAffiliatePayout,
   getFinanceJournals,
   getLedgerIntegrity,
-  requestTaxExport,
-  getTaxExport,
-  downloadTaxExport,
   getMyBankAccount,
   listAdminPayouts,
   listAllCommitments,
@@ -60,7 +57,16 @@ import {
   simulateVnpayIpn,
   purchaseVoucher,
   checkoutMembership,
+  listBanks,
+  loadPolicyRates,
+  selectPolicyGroup,
+  requestBankOtp,
+  getPinStatus,
+  setupPin,
 } from './api.js';
+import { getSmartOtpProof } from './smartOtp.js';
+import ReadinessPanel from './components/ReadinessPanel.vue';
+import AllFieldsTable from './components/AllFieldsTable.vue';
 import {
   PAYOUT_STEPS,
   attachLedger,
@@ -72,12 +78,14 @@ import {
   payoutStepLineage,
   vnd,
   computeSplit,
+  rates,
 } from './lineage.js';
 import ProductCatalogSelector from './components/ProductCatalogSelector.vue';
 import DataLineageInspector from './components/DataLineageInspector.vue';
 import PayoutApprovalStepper from './components/PayoutApprovalStepper.vue';
 import MembershipFlow from './MembershipFlow.vue';
 import VoucherPayoutFlow from './VoucherPayoutFlow.vue';
+import TaxExportPanel from './components/TaxExportPanel.vue';
 
 const STORAGE_FLOW_STATE = 'ct_payout_flow_state';
 
@@ -160,14 +168,15 @@ const ui = reactive({
   lastOrder: null,
 });
 
+// TRUST-867: the BE only takes { bank: <6-digit BIN>, account, password, otp } (+ X-Pin-Token for creator/merchant).
+// bankName / accountName are resolved by the BE (OpenBankGate lookup), they are not inputs any more.
 const newBankForm = reactive({
   bankBin: '970436',
-  bankCode: 'VCB',
-  bankName: 'Ngân hàng TMCP Ngoại Thương Việt Nam',
-  bankShortName: 'Vietcombank',
   accountNumber: '0071009998888',
-  accountName: 'QUANG CREATOR',
+  otp: '000000', // dev/staging bypass; the real code is emailed by "Gửi email OTP"
 });
+const banks = ref([]);
+const pinInfo = reactive({ creatorStatus: '', affiliatePin: '482915' });
 
 function notify(message, type = 'info') {
   ui.toast = { message, type };
@@ -200,6 +209,27 @@ function money(val) {
   const num = Number(val);
   if (Number.isNaN(num)) return `${val} ₫`;
   return `${num.toLocaleString('vi-VN')} ₫`;
+}
+
+// The 8 integrity counters the BE returns (ledger-integrity.res.dto.ts); healthy = balanced && all counters 0.
+const INTEGRITY_COUNTERS = [
+  { key: 'staleDraftCount', label: 'Stale drafts (>5 phút)' },
+  { key: 'orphanPayoutJournalCount', label: 'Orphan payout journals' },
+  { key: 'payoutStateJournalMismatchCount', label: 'Payout state ≠ journal' },
+  { key: 'payoutAllocationMismatchCount', label: 'Payout allocation mismatch' },
+  { key: 'treasurySettlementMismatchCount', label: 'Treasury settlement mismatch' },
+  { key: 'paymentLedgerMismatchCount', label: 'Payment ≠ ledger' },
+  { key: 'earningLedgerMismatchCount', label: 'Earning ≠ ledger' },
+];
+
+function journalBalanced(j) {
+  let d = 0n;
+  let c = 0n;
+  for (const l of j.lines || []) {
+    const v = BigInt(String(l.amountVnd ?? '0').replace(/\D/g, '') || '0');
+    if (l.side === 'DEBIT') d += v; else c += v;
+  }
+  return d === c;
 }
 
 function formatDate(iso) {
@@ -615,8 +645,41 @@ async function handleGetCreatorBank() {
   ui.creatorBankAccount = res.data;
 }
 
+async function handleLoadRates() {
+  await run('Load real fee/tax policy', () => loadPolicyRates(sessions.reconciler));
+  notify(`Tỉ lệ thật: phí ${rates.feeBps / 100}% · thuế ${rates.taxBps / 100}% — ${rates.source}`, 'success');
+}
+
+async function handleLoadBanks() {
+  const res = await run('Public bank list', () => listBanks());
+  banks.value = res.data?.items || res.data || [];
+}
+
+async function handleCreatorPinStatus() {
+  const res = await run('Creator PIN status', () => getPinStatus(sessions.creator));
+  pinInfo.creatorStatus = res.data?.status || '';
+}
+
+async function handleSetupCreatorPin() {
+  await run('Setup creator PIN', () => setupPin(sessions.creator, sessions.creator.password, sessions.creator.pin));
+  await handleCreatorPinStatus();
+  notify('PIN đã thiết lập', 'success');
+}
+
+async function handleRequestCreatorBankOtp() {
+  await run('Creator bank email OTP', () => requestBankOtp(sessions.creator));
+  notify('Đã gửi email OTP (dev/staging nhận 000000)', 'success');
+}
+
 async function handleAddCreatorBank() {
-  const res = await run('Add Creator Bank Account', () => addBankAccount(sessions.creator, newBankForm));
+  const res = await run('Add Creator Bank Account', () =>
+    addBankAccount(sessions.creator, {
+      bank: newBankForm.bankBin,
+      account: newBankForm.accountNumber,
+      password: sessions.creator.password,
+      otp: newBankForm.otp,
+    }),
+  );
   ui.creatorBankAccount = res.data;
   notify('Bank account added for creator!', 'success');
 }
@@ -627,6 +690,7 @@ async function handleRequestCreatorPayout() {
     requestCreatorPayout(sessions.creator, {
       amountVnd: flow.payoutAmountVnd,
       idempotencyKey: flow.payoutIdempotencyKey,
+      // BE @RequirePin(PAYOUT): PIN 6 số của creator (nhập ở khung PIN phía trên).
     }),
   );
   const payout = res.data;
@@ -788,10 +852,7 @@ async function handleCancelPayout() {
 // -------------------------------------------------------------
 // STEP 8: Affiliate (User B) — referral, earnings & payout
 // -------------------------------------------------------------
-// Estimated split for the selected listing. Fee 10% and tax 7% mirror the seeded
-// GROSS_AMOUNT policy; the posted journal (Stage 7) is the source of truth.
-const PLATFORM_FEE_BPS = 1000;
-const WITHHOLDING_TAX_BPS = 700;
+// Estimated split for the selected listing. Rates come from the active finance policy (see handleLoadRates); the posted journal (Stage 7) is the source of truth.
 function percentHalfUp(amount, bps) {
   return (BigInt(amount) * BigInt(bps) + 5000n) / 10000n;
 }
@@ -799,8 +860,9 @@ const expectedSplit = computed(() => {
   const listing = ui.selectedListing;
   if (!listing || !/^\d+$/.test(String(listing.priceVnd))) return null;
   const gross = BigInt(listing.priceVnd);
-  const fee = percentHalfUp(gross, PLATFORM_FEE_BPS);
-  const tax = percentHalfUp(gross, WITHHOLDING_TAX_BPS);
+  const fee = percentHalfUp(gross, rates.feeBps);
+  // The BE rounds VAT and TNCN separately (half-up each), then adds them.
+  const tax = percentHalfUp(gross, rates.vatBps) + percentHalfUp(gross, rates.pitBps);
   const affiliate = percentHalfUp(gross, listing.affiliateShareBps || 0);
   return {
     gross: gross.toString(),
@@ -849,12 +911,20 @@ async function handleGetAffiliateBank() {
 
 async function handleRequestAffiliatePayout() {
   const key = `payout-${uuid()}`;
-  const res = await run('Submit Affiliate Payout Request', () =>
-    requestAffiliatePayout(sessions.affiliate, {
+  const res = await run('Submit Affiliate Payout Request', async () => {
+    // BE (root payout): body.smartOtp bound to { amountVnd, idempotencyKey } via purpose PAYOUT_CONFIRM.
+    const smartOtp = await getSmartOtpProof(sessions.affiliate, {
+      purpose: 'PAYOUT_CONFIRM',
+      subjectType: 'PAYOUT',
+      params: { amountVnd: String(flow.affiliatePayoutAmountVnd).replace(/\D/g, ''), idempotencyKey: key },
+      pin: pinInfo.affiliatePin,
+    });
+    return requestAffiliatePayout(sessions.affiliate, {
       amountVnd: flow.affiliatePayoutAmountVnd,
       idempotencyKey: key,
-    }),
-  );
+      smartOtp,
+    });
+  });
   flow.payoutId = String(res.data.id);
   flow.payoutAmountVnd = String(flow.affiliatePayoutAmountVnd);
   ui.payoutStepLineages = {};
@@ -867,63 +937,6 @@ async function handleRequestAffiliatePayout() {
 // -------------------------------------------------------------
 // STEP 7: Double-Entry Ledger Inspector
 // -------------------------------------------------------------
-// Withholding tax export: queue a background job, poll until READY, then download.
-function vnToday() {
-  return new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10);
-}
-const taxExport = reactive({
-  from: `${vnToday().slice(0, 8)}01`,
-  to: vnToday(),
-  status: null,
-});
-
-function saveBlob(blob, fileName) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-}
-
-async function handleTaxExport() {
-  const session = sessions.approver;
-  const created = await run('Queue withholding tax export', () =>
-    requestTaxExport(session, { from: taxExport.from, to: taxExport.to }),
-  );
-  taxExport.status = created.data;
-  const exportId = created.data.exportId;
-  ui.busy = 'Waiting for tax export job';
-  try {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      const res = await getTaxExport(session, exportId);
-      taxExport.status = res.data;
-      ui.rawResponse = res.body;
-      if (res.data.status === 'READY' || res.data.status === 'FAILED') break;
-    }
-  } finally {
-    ui.busy = '';
-  }
-  if (taxExport.status?.status !== 'READY') {
-    notify(`Tax export ${taxExport.status?.status || 'UNKNOWN'} ${taxExport.status?.errorCode || ''}`.trim(), 'error');
-    return;
-  }
-  await handleDownloadTaxExport();
-}
-
-async function handleDownloadTaxExport() {
-  const exportId = taxExport.status?.exportId;
-  if (!exportId) return;
-  const file = await run('Download withholding tax workbook', () =>
-    downloadTaxExport(sessions.approver, exportId),
-  );
-  saveBlob(file.blob, file.fileName);
-  notify(`Downloaded ${file.fileName}`, 'success');
-}
-
 async function handleCheckLedger() {
   const [intRes, jnlRes] = await Promise.all([
     run('Ledger Integrity Report', () => getLedgerIntegrity(sessions.reconciler)),
@@ -1167,6 +1180,7 @@ function openVoucherFlow() {
         <span class="step-number">10</span>
         <span>Voucher Full Flow</span>
       </div>
+
     </nav>
 
     <!-- Main Content Area based on Stage -->
@@ -1227,6 +1241,27 @@ function openVoucherFlow() {
               </tr>
             </tbody>
           </table>
+          <div class="callout info" style="margin-top: 12px; font-size: 0.8rem;">
+            Tỉ lệ phí/thuế đang dùng để ước tính: <b>phí {{ rates.feeBps / 100 }}% · thuế {{ rates.taxBps / 100 }}%</b> — nguồn: {{ rates.source }}.
+            <button class="secondary" style="padding: 4px 10px; font-size: 0.75rem; margin-left: 8px;" :disabled="!!ui.busy || !sessions.reconciler.accessToken" @click="handleLoadRates">Tải tỉ lệ thật từ BE (cần Login reconciler)</button>
+            <div v-if="rates.groups.length" class="table-container" style="margin-top: 8px;">
+              <table>
+                <thead><tr><th>Nhóm người bán</th><th>v</th><th>Phí sàn</th><th>VAT</th><th>PIT</th><th>Tổng thuế</th><th></th></tr></thead>
+                <tbody>
+                  <tr v-for="g in rates.groups" :key="g.group" :style="g.group === rates.group ? 'font-weight:700' : ''">
+                    <td><code>{{ g.group }}</code></td>
+                    <td>{{ g.current?.versionNo ?? '—' }}</td>
+                    <td>{{ g.current ? g.current.platformFeeBps / 100 + '%' : '—' }}</td>
+                    <td>{{ g.current ? g.current.vatBps / 100 + '%' : '—' }}</td>
+                    <td>{{ g.current ? g.current.pitBps / 100 + '%' : '—' }}</td>
+                    <td>{{ g.current ? (g.current.vatBps + g.current.pitBps) / 100 + '%' : '—' }}</td>
+                    <td><button class="secondary" style="padding: 2px 8px; font-size: 0.72rem;" :disabled="!g.current" @click="selectPolicyGroup(g.group)">Dùng để ước tính</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <ReadinessPanel />
         </div>
       </section>
 
@@ -1236,7 +1271,7 @@ function openVoucherFlow() {
           <div class="panel-header-left">
             <span class="panel-step-badge">2</span>
             <div>
-              <h2>Stage 2: Buyer chọn sản phẩm &amp; mua 1-Click</h2>
+              <h2>Stage 2: Buyer chọn sản phẩm &amp; mua 1-Click <code class="tbl-tag">DB: payment_orders · cart_checkout_units · carts · cart_items · vouchers · commitment_listings · membership_plans</code></h2>
               <p>Danh sách tự tải từ API (thẻ cam kết, voucher, gói hội viên) — không cần nhập ID.</p>
             </div>
           </div>
@@ -1261,7 +1296,7 @@ function openVoucherFlow() {
 
           <div class="col-4">
             <div class="metric-card highlight" style="gap: 8px;">
-              <h3 style="font-size: 0.95rem;">⚡ 1-Click Flow</h3>
+              <h3 style="font-size: 0.95rem;">⚡ 1-Click Flow <code class="tbl-tag">DB: payment_orders (+ reserved_voucher_id → vouchers)</code></h3>
               <div class="callout info" style="font-size: 0.78rem;">
                 Buyer: <strong>{{ sessions.buyer.identifier }}</strong>
                 ({{ sessions.buyer.accessToken ? 'đã đăng nhập' : 'sẽ tự đăng nhập khi mua' }})
@@ -1273,7 +1308,7 @@ function openVoucherFlow() {
             </div>
 
             <div class="metric-card" style="gap: 10px; margin-top: 14px;">
-              <h3 style="font-size: 0.95rem;">🧺 Giỏ hàng Multi-Seller (1 đơn VNPay)</h3>
+              <h3 style="font-size: 0.95rem;">🧺 Giỏ hàng Multi-Seller (1 đơn VNPay) <code class="tbl-tag">DB: carts · cart_items → payment_orders (CART_CHECKOUT) · cart_checkout_units</code></h3>
               <div v-if="ui.cartPreview?.items?.length" class="table-container">
                 <table>
                   <thead><tr><th>Item</th><th>Người bán</th><th>Giá</th><th>OK</th></tr></thead>
@@ -1316,7 +1351,7 @@ function openVoucherFlow() {
           <div class="panel-header-left">
             <span class="panel-step-badge">3</span>
             <div>
-              <h2>Stage 3: VNPay Payment & Fulfillment Verification</h2>
+              <h2>Stage 3: VNPay Payment & Fulfillment Verification <code class="tbl-tag">DB: payment_orders · vnpay_transactions · vnpay_ipn_logs · payment_provider_events · finance_journals (PAYMENT_CAPTURED)</code></h2>
               <p>Simulate or complete payment on VNPay sandbox, then verify entitlement & ledger recognition.</p>
             </div>
           </div>
@@ -1329,7 +1364,7 @@ function openVoucherFlow() {
         <div class="flow-grid">
           <div class="col-6">
             <div class="metric-card highlight" style="gap: 14px;">
-              <h3 style="font-size: 0.95rem;">VNPay Checkout Order Details</h3>
+              <h3 style="font-size: 0.95rem;">VNPay Checkout Order Details <code class="tbl-tag">DB: payment_orders (app_trans_id = txnRef, status, fulfillment_status)</code></h3>
               <div class="fact-grid">
                 <div class="fact-item">
                   <span class="label">Payment Order ID</span>
@@ -1376,7 +1411,7 @@ function openVoucherFlow() {
 
           <div class="col-6">
             <div class="metric-card" style="gap: 12px;">
-              <h3 style="font-size: 0.95rem;">Local Development Simulation Helper</h3>
+              <h3 style="font-size: 0.95rem;">Local Development Simulation Helper <code class="tbl-tag">DB: ghi: vnpay_ipn_logs, vnpay_transactions, payment_orders</code></h3>
               <p class="muted" style="font-size: 0.82rem;">
                 Since VNPay's live IPN webhook cannot reach <code>localhost</code> directly, you can simulate server-to-server settlement in two ways:
               </p>
@@ -1394,7 +1429,7 @@ function openVoucherFlow() {
                 <strong>Fulfillment Behavior:</strong>
                 <span>Upon successful payment settlement, <code>CommitmentTemplatePaymentFulfillmentHandler</code> automatically executes:
                 1. Grants/merges commitment template entitlement for the buyer.
-                2. Posts agent sale recognition to double-entry ledger (credits Creator net payable, credits 10% platform commission, credits 7% withholding tax, and — when the buyer was referred — credits the affiliate share to AFFILIATE_PAYABLE for User B, netted out of the creator line).</span>
+                2. Posts agent sale recognition to double-entry ledger (credits Creator net payable, credits the platform commission, credits the withheld tax (rates come from the active finance policy), and — when the buyer was referred — credits the affiliate share to AFFILIATE_PAYABLE for User B, netted out of the creator line).</span>
               </div>
             </div>
           </div>
@@ -1460,7 +1495,7 @@ function openVoucherFlow() {
 
         <!-- Earnings Breakdown Table -->
         <div style="margin-top: 16px;">
-          <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Source-Level Earnings Breakdown (Fee & Tax Recognition)</h3>
+          <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Source-Level Earnings Breakdown (Fee & Tax Recognition) <code class="tbl-tag">DB: finance_journals + finance_journal_lines + finance_policy_versions (dẫn xuất, không có bảng earnings riêng)</code></h3>
           <div v-if="ui.creatorEarnings.length === 0" class="callout info">
             Click "Refresh Balances" to load earnings entries.
           </div>
@@ -1469,9 +1504,12 @@ function openVoucherFlow() {
               <thead>
                 <tr>
                   <th>Event Source</th>
+                  <th>Loại</th>
+                  <th>Sản phẩm</th>
+                  <th>Journal / Order</th>
                   <th>Occurred At</th>
                   <th>Gross Amount</th>
-                  <th>Platform Fee (10%)</th>
+                  <th>Platform Fee</th>
                   <th>Withholding Tax</th>
                   <th>Affiliate Share</th>
                   <th>Net Payable</th>
@@ -1479,11 +1517,14 @@ function openVoucherFlow() {
               </thead>
               <tbody>
                 <tr v-for="item in ui.creatorEarnings" :key="item.id || item.eventSourceId">
-                  <td><code>{{ item.revenueSourceCode || item.eventSourceType || 'CommitmentTemplateSale' }}</code></td>
+                  <td><code>{{ item.revenueSourceCode || item.sourceType || item.eventSourceType || 'CommitmentTemplateSale' }}</code><div class="muted mono" style="font-size:0.68rem">{{ item.sourceId }}</div></td>
+                  <td>{{ item.earningKind }}</td>
+                  <td>{{ item.productType }}<div class="muted" style="font-size:0.7rem">{{ item.productName }}</div></td>
+                  <td class="mono" style="font-size:0.72rem">J#{{ item.journalId }}<br />PO#{{ item.paymentOrderId }}</td>
                   <td>{{ formatDate(item.occurredAt || item.createdAt) }}</td>
                   <td style="color: var(--text-main); font-weight: 600;">{{ money(item.grossAmountVnd) }}</td>
-                  <td style="color: var(--warning);">- {{ money(item.platformFeeVnd) }}</td>
-                  <td style="color: var(--danger);">- {{ money(item.taxWithheldVnd) }}</td>
+                  <td style="color: var(--warning);">- {{ money(item.platformFeeVnd) }}<div v-for="c in (item.charges || []).filter(x => x.kind === 'FEE')" :key="c.code" class="muted mono" style="font-size:0.66rem">{{ c.code }}</div></td>
+                  <td style="color: var(--danger);">- {{ money(item.taxWithheldVnd) }}<div v-for="c in (item.charges || []).filter(x => x.kind === 'TAX')" :key="c.code" class="muted mono" style="font-size:0.66rem">{{ c.code }}: {{ money(c.amountVnd) }}</div></td>
                   <td style="color: var(--primary);">
                     - {{ money(item.affiliateShareVnd) }}
                     <span v-if="item.affiliateShareBps" class="muted" style="font-size: 0.7rem;">({{ (item.affiliateShareBps / 100).toFixed(2) }}%)</span>
@@ -1494,6 +1535,35 @@ function openVoucherFlow() {
             </table>
           </div>
         </div>
+
+        <!-- Statement (ledger lines with VAS codes) -->
+        <div style="margin-top: 16px;" v-if="ui.creatorStatement.length">
+          <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Creator Statement (dòng sổ cái + mã VAS) <code class="tbl-tag">DB: finance_journal_lines JOIN finance_accounts JOIN finance_journals</code></h3>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr><th>Line</th><th>Journal</th><th>Event</th><th>Account</th><th>VAS</th><th>Dr/Cr</th><th>Amount</th><th>Reference</th><th>Occurred At</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="l in ui.creatorStatement" :key="l.lineId">
+                  <td class="mono">{{ l.lineId }}</td>
+                  <td class="mono">{{ l.journalId }}</td>
+                  <td><code>{{ l.eventType }}</code></td>
+                  <td><code>{{ l.accountCode }}</code></td>
+                  <td>{{ l.vasAccountCode }} <span class="muted" style="font-size:0.7rem">{{ l.vasAccountName }}</span></td>
+                  <td>{{ l.side }}</td>
+                  <td>{{ money(l.amountVnd) }}</td>
+                  <td class="mono" style="font-size:0.72rem">{{ l.referenceType }} {{ l.referenceId }}</td>
+                  <td>{{ formatDate(l.occurredAt) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <AllFieldsTable table="finance_journal_lines (CREATOR_PAYABLE) + finance_holds + finance_payouts" title="Balance (tất cả field)" :rows="ui.creatorBalance ? [ui.creatorBalance] : []" open />
+        <AllFieldsTable table="finance_journals + finance_journal_lines" title="Earnings (tất cả field, gồm charges[])" :rows="ui.creatorEarnings" />
+        <AllFieldsTable table="finance_journal_lines + finance_accounts" title="Statement (tất cả field)" :rows="ui.creatorStatement" />
       </section>
 
       <!-- STAGE 5: Creator Bank Account & Payout Request -->
@@ -1531,7 +1601,7 @@ function openVoucherFlow() {
           <!-- Bank Account Info / Form -->
           <div class="col-6">
             <div class="metric-card" style="gap: 12px;">
-              <h3 style="font-size: 0.95rem;">Creator Bank Account</h3>
+              <h3 style="font-size: 0.95rem;">Creator Bank Account <code class="tbl-tag">DB: user_bank_accounts</code></h3>
               <div v-if="ui.creatorBankAccount" class="fact-grid">
                 <div class="fact-item">
                   <span class="label">Bank Name</span>
@@ -1552,24 +1622,46 @@ function openVoucherFlow() {
               </div>
 
               <div v-else style="display: flex; flex-direction: column; gap: 10px;">
-                <p class="muted" style="font-size: 0.82rem;">No bank account registered. Use the preset below to register one:</p>
+                <p class="muted" style="font-size: 0.82rem;">
+                  Chưa có tài khoản ngân hàng. BE (TRUST-867) yêu cầu: PIN creator → email OTP → ghi kèm <code>X-Pin-Token</code> (BANK_ACCOUNT_CHANGE).
+                </p>
                 <div class="form-row">
                   <div class="form-group">
-                    <label>Bank Short Name</label>
-                    <input v-model="newBankForm.bankShortName" />
+                    <label>PIN creator (6 số)</label>
+                    <input v-model="sessions.creator.pin" maxlength="6" inputmode="numeric" />
                   </div>
                   <div class="form-group">
-                    <label>Account Number</label>
+                    <label>Trạng thái PIN</label>
+                    <span class="badge">{{ pinInfo.creatorStatus || '—' }}</span>
+                  </div>
+                </div>
+                <div class="button-group">
+                  <button class="secondary" @click="handleCreatorPinStatus" :disabled="!!ui.busy">Kiểm tra PIN</button>
+                  <button class="secondary" @click="handleSetupCreatorPin" :disabled="!!ui.busy || !/^\d{6}$/.test(sessions.creator.pin || '')">Thiết lập PIN</button>
+                </div>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label>Ngân hàng (BIN 6 số)</label>
+                    <select v-model="newBankForm.bankBin" @focus="!banks.length && handleLoadBanks()">
+                      <option v-if="!banks.length" :value="newBankForm.bankBin">{{ newBankForm.bankBin }}</option>
+                      <option v-for="b in banks" :key="b.bin || b.bankBin" :value="b.bin || b.bankBin">{{ b.shortName || b.bankShortName || b.name }} ({{ b.bin || b.bankBin }})</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label>Số tài khoản</label>
                     <input v-model="newBankForm.accountNumber" />
                   </div>
                 </div>
                 <div class="form-group">
-                  <label>Beneficiary Account Name</label>
-                  <input v-model="newBankForm.accountName" />
+                  <label>Email OTP (dev/staging: 000000)</label>
+                  <input v-model="newBankForm.otp" maxlength="6" />
                 </div>
-                <button class="secondary" @click="handleAddCreatorBank" :disabled="!!ui.busy">
-                  Register Bank Account
-                </button>
+                <div class="button-group">
+                  <button class="secondary" @click="handleRequestCreatorBankOtp" :disabled="!!ui.busy || !/^\d{6}$/.test(sessions.creator.pin || '')">Gửi email OTP</button>
+                  <button class="secondary" @click="handleAddCreatorBank" :disabled="!!ui.busy || !/^\d{6}$/.test(sessions.creator.pin || '')">
+                    Register Bank Account
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1577,7 +1669,7 @@ function openVoucherFlow() {
           <!-- Payout Request Form -->
           <div class="col-6">
             <div class="metric-card highlight" style="gap: 12px;">
-              <h3 style="font-size: 0.95rem;">Request Manual-Accounting Payout</h3>
+              <h3 style="font-size: 0.95rem;">Request Manual-Accounting Payout <code class="tbl-tag">DB: finance_payouts</code></h3>
               <div class="form-group">
                 <label>Payout Amount (VND)</label>
                 <div style="display: flex; gap: 6px;">
@@ -1591,6 +1683,7 @@ function openVoucherFlow() {
               </div>
               <div class="callout warning" style="font-size: 0.78rem;">
                 Amount must be &gt;= 10,000 VND and &lt;= Available Balance ({{ money(ui.creatorBalance?.available) }}).
+                Creator payout cần PIN 6 số (<code>X-Pin-Token</code> reason PAYOUT, tự lấy từ PIN ở khung ngân hàng).
               </div>
               <button
                 class="success"
@@ -1602,6 +1695,8 @@ function openVoucherFlow() {
             </div>
           </div>
         </div>
+      <AllFieldsTable table="user_bank_accounts" title="Creator bank account (tất cả field)" :rows="ui.creatorBankAccount ? [ui.creatorBankAccount] : []" />
+        <AllFieldsTable table="finance_payouts + finance_payout_allocations" title="Creator payouts (tất cả field)" :rows="ui.creatorPayouts" open />
       </section>
 
       <!-- STAGE 6: Accounting / Admin Payout Lifecycle -->
@@ -1686,6 +1781,7 @@ function openVoucherFlow() {
             />
           </div>
         </div>
+      <AllFieldsTable table="finance_payouts + finance_payout_allocations" title="Admin payouts (tất cả field)" :rows="ui.adminPayouts" open />
       </section>
 
       <!-- STAGE 7: Double-Entry Ledger Inspector -->
@@ -1740,44 +1836,29 @@ function openVoucherFlow() {
                 <span class="metric-label">Membership Mismatches</span>
                 <span class="metric-value">{{ ui.ledgerIntegrity?.membershipLedgerMismatchCount ?? 0 }}</span>
               </div>
+
+              <div
+                v-for="c in INTEGRITY_COUNTERS"
+                :key="c.key"
+                class="metric-card"
+                :class="ui.ledgerIntegrity?.[c.key] === 0 ? 'success' : (ui.ledgerIntegrity ? 'warning' : '')"
+                style="border-left: 3px solid var(--primary);"
+              >
+                <span class="metric-label">{{ c.label }}</span>
+                <span class="metric-value">{{ ui.ledgerIntegrity?.[c.key] ?? '—' }}</span>
+                <span class="muted mono" style="font-size: 0.66rem;">{{ c.key }}</span>
+              </div>
             </div>
           </div>
 
-          <!-- Withholding Tax Export -->
+          <!-- Withholding Tax Export (preset, TRUST-913) -->
           <div class="col-12">
-            <div class="callout info" style="display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;">
-              <div style="flex: 1 1 260px;">
-                <strong>🧾 Withholding Tax Export (Excel)</strong>
-                <div class="muted" style="font-size: 0.78rem;">
-                  Runs as a background job as the Finance Approver. The file stays downloadable for 1 hour, only by that admin.
-                </div>
-              </div>
-              <div class="form-group" style="margin: 0;">
-                <label>From (VN date)</label>
-                <input v-model="taxExport.from" type="date" />
-              </div>
-              <div class="form-group" style="margin: 0;">
-                <label>To (VN date)</label>
-                <input v-model="taxExport.to" type="date" />
-              </div>
-              <button class="success" @click="handleTaxExport" :disabled="!!ui.busy || !sessions.approver.accessToken">
-                📥 Export Tax Excel
-              </button>
-              <button class="secondary" @click="handleDownloadTaxExport" :disabled="!!ui.busy || taxExport.status?.status !== 'READY'">
-                Download again
-              </button>
-            </div>
-            <div v-if="taxExport.status" class="fact-grid" style="margin-top: 10px;">
-              <div class="fact-item"><span class="label">Export ID</span><span class="value mono">{{ taxExport.status.exportId }}</span></div>
-              <div class="fact-item"><span class="label">Status</span><span class="badge" :class="statusBadgeClass(taxExport.status.status === 'READY' ? 'SUCCEEDED' : taxExport.status.status)">{{ taxExport.status.status }}</span></div>
-              <div class="fact-item"><span class="label">Rows / Sellers</span><span class="value">{{ taxExport.status.rowCount ?? '-' }} / {{ taxExport.status.sellerCount ?? '-' }}</span></div>
-              <div class="fact-item"><span class="label">Expires</span><span class="value">{{ formatDate(taxExport.status.expiresAt) }}</span></div>
-            </div>
+            <TaxExportPanel />
           </div>
 
           <!-- Recent Journals Table -->
           <div class="col-12">
-            <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Recent Ledger Journal Entries</h3>
+            <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Recent Ledger Journal Entries <code class="tbl-tag">DB: finance_journals + finance_journal_lines + finance_accounts</code></h3>
             <div v-if="ui.financeJournals.length === 0" class="callout info">
               Click "Re-Run Ledger Audit" to fetch journals.
             </div>
@@ -1786,18 +1867,25 @@ function openVoucherFlow() {
                 <thead>
                   <tr>
                     <th>Journal ID</th>
-                    <th>Source Type</th>
-                    <th>Source ID</th>
-                    <th>Description</th>
-                    <th>Created At</th>
+                    <th>Event Type / Key</th>
+                    <th>Source</th>
+                    <th>Dòng Dr / Cr (VAS)</th>
+                    <th>ΣDr = ΣCr</th>
+                    <th>Occurred At</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="j in ui.financeJournals" :key="j.id">
                     <td><code>#{{ j.id }}</code></td>
-                    <td><span class="client-id-tag">{{ j.eventSourceType || j.sourceType }}</span></td>
-                    <td><code>{{ j.eventSourceId || j.sourceId || '-' }}</code></td>
-                    <td>{{ j.description || j.memo || 'Financial Transaction' }}</td>
+                    <td><span class="client-id-tag">{{ j.eventType }}</span><div class="muted mono" style="font-size:0.66rem">{{ j.eventKey }}</div></td>
+                    <td><code>{{ j.eventSourceType || j.sourceType }} {{ j.eventSourceId || j.sourceId || '-' }}</code></td>
+                    <td>
+                      <div v-for="(l, i) in (j.lines || [])" :key="i" class="mono" style="font-size:0.72rem">
+                        {{ l.side === 'DEBIT' ? 'Dr' : 'Cr' }} {{ l.vasAccountCode }} <code>{{ l.accountCode }}</code> {{ money(l.amountVnd) }}
+                        <span class="muted">{{ l.vasAccountName }}<template v-if="l.partyType"> · {{ l.partyType }}#{{ l.partyId }}</template></span>
+                      </div>
+                    </td>
+                    <td>{{ journalBalanced(j) ? '✓' : '✗' }}</td>
                     <td>{{ formatDate(j.createdAt || j.occurredAt) }}</td>
                   </tr>
                 </tbody>
@@ -1805,6 +1893,8 @@ function openVoucherFlow() {
             </div>
           </div>
         </div>
+      <AllFieldsTable table="finance_journals + finance_journal_lines + finance_payouts + payment_orders (đối chiếu)" title="Ledger integrity (8 counters + balanced + healthy)" :rows="ui.ledgerIntegrity ? [ui.ledgerIntegrity] : []" open />
+        <AllFieldsTable table="finance_journals + finance_journal_lines + finance_accounts" title="Journals (tất cả field, gồm lines[])" :rows="ui.financeJournals" />
       </section>
 
       <!-- STAGE 8: Affiliate (User B) -->
@@ -1854,7 +1944,7 @@ function openVoucherFlow() {
 
           <div class="col-6">
             <div class="metric-card" style="gap: 10px;">
-              <h3 style="font-size: 0.95rem;">Affiliate Bank Account</h3>
+              <h3 style="font-size: 0.95rem;">Affiliate Bank Account <code class="tbl-tag">DB: user_bank_accounts</code></h3>
               <div v-if="ui.affiliateBankAccount" class="fact-grid">
                 <div class="fact-item"><span class="label">Bank</span><span class="value">{{ ui.affiliateBankAccount.bankShortName || ui.affiliateBankAccount.bankName }}</span></div>
                 <div class="fact-item"><span class="label">Account Number</span><span class="value">{{ ui.affiliateBankAccount.accountNumber }}</span></div>
@@ -1891,7 +1981,7 @@ function openVoucherFlow() {
         </div>
 
         <div style="margin-top: 16px;">
-          <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Affiliate Commission Sources</h3>
+          <h3 style="font-size: 0.95rem; margin-bottom: 10px;">Affiliate Commission Sources <code class="tbl-tag">DB: finance_journals + finance_journal_lines (AFFILIATE_PAYABLE) + cart_checkout_units</code></h3>
           <div v-if="ui.affiliateEarnings.length === 0" class="callout info">
             No commission yet. Buy a listing with an affiliate % as the referred buyer (Stage 2–3), then refresh.
           </div>
@@ -1940,7 +2030,7 @@ function openVoucherFlow() {
             </div>
           </div>
           <div class="col-6">
-            <h3 style="font-size: 0.95rem; margin-bottom: 10px;">My Affiliate Payouts</h3>
+            <h3 style="font-size: 0.95rem; margin-bottom: 10px;">My Affiliate Payouts <code class="tbl-tag">DB: finance_payouts + finance_payout_allocations</code></h3>
             <div v-if="ui.affiliatePayouts.length === 0" class="muted" style="font-size: 0.8rem;">None yet.</div>
             <div v-else class="table-container">
               <table>
@@ -1959,6 +2049,10 @@ function openVoucherFlow() {
             </div>
           </div>
         </div>
+      <AllFieldsTable table="finance_journal_lines (AFFILIATE_PAYABLE) + finance_holds + finance_payouts" title="Affiliate balance (tất cả field)" :rows="ui.affiliateBalance ? [ui.affiliateBalance] : []" open />
+        <AllFieldsTable table="finance_journals + finance_journal_lines" title="Affiliate earnings (tất cả field)" :rows="ui.affiliateEarnings" />
+        <AllFieldsTable table="finance_journal_lines + finance_accounts" title="Affiliate statement (tất cả field)" :rows="ui.affiliateStatement" />
+        <AllFieldsTable table="finance_payouts + finance_payout_allocations" title="Affiliate payouts (tất cả field)" :rows="ui.affiliatePayouts" />
       </section>
 
       <!-- STAGE 9: Membership & Double-Entry Ledger (PR Feature) -->
@@ -1988,7 +2082,7 @@ function openVoucherFlow() {
           <div class="fact-item"><span class="label">Người mua</span><span class="value">{{ sessions.buyer.identifier }}</span></div>
         </div>
         <div v-if="buySplit" class="muted" style="font-size: 0.78rem;">
-          Dự kiến chia: người bán {{ vnd(buySplit.net) }} · phí sàn 10% {{ vnd(buySplit.fee) }} · thuế 7% {{ vnd(buySplit.tax) }}
+          Dự kiến chia: người bán {{ vnd(buySplit.net) }} · phí sàn {{ rates.feeBps / 100 }}% {{ vnd(buySplit.fee) }} · thuế {{ rates.taxBps / 100 }}% (VAT {{ rates.vatBps / 100 }}% + TNCN {{ rates.pitBps / 100 }}%) {{ vnd(buySplit.tax) }} <span class="muted">[{{ rates.source }}]</span>
           <span v-if="Number(buySplit.affiliate) > 0"> · affiliate {{ vnd(buySplit.affiliate) }}</span>
         </div>
         <label style="font-size: 0.82rem; display: flex; gap: 6px; align-items: center;">

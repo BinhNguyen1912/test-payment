@@ -87,10 +87,25 @@ const productTypeOf = (kind) => (kind === 'commitments' ? 'COMMITMENT_TEMPLATE' 
 async function addToCart(kind, item) {
   await guard(async () => {
     const quantity = Number(qty[`${kind}:${item.id}`] || 1);
-    const body = { productType: productTypeOf(kind), productId: String(item.id), quantity };
-    const res = await call(`Thêm giỏ: ${titleOf(item)}`, 'POST', '/web/cart/items', { body, auto: { productType: 'theo tab đang xem', productId: 'id từ GET danh sách' }, typed: { quantity } });
-    cart.value = res.data;
-    await refreshPreview();
+    // Thẻ cam kết: item.id là id LISTING (dùng cho /purchase). Giỏ hàng cần id TEMPLATE = item.commitment.templateId,
+    // nếu gửi listing id thì backend trả 404 CART_PRODUCT_NOT_FOUND.
+    const productId = kind === 'commitments' ? item.commitment?.templateId : item.id;
+    if (!productId) throw new Error('Không tìm thấy commitment.templateId trong item của danh sách');
+    const body = { productType: productTypeOf(kind), productId: String(productId), quantity };
+    try {
+      const res = await call(`Thêm giỏ: ${titleOf(item)}`, 'POST', '/web/cart/items', { body, auto: { productType: 'theo tab đang xem', productId: kind === 'commitments' ? 'commitment.templateId từ GET danh sách (không phải id listing)' : 'id từ GET danh sách' }, typed: { quantity } });
+      cart.value = res.data;
+      await refreshPreview();
+    } catch (e) {
+      // Backend trả 404 CART_PRODUCT_NOT_FOUND cả khi sản phẩm chỉ không còn đủ điều kiện mua (hết hàng,
+      // hết hạn mở bán, chưa publish...), vì bước kiểm tra dùng chung bộ lọc marketplace. Tải lại danh sách để khớp.
+      if (e.code === 'CART_PRODUCT_NOT_FOUND') {
+        await loadList(kind);
+        err.value = `CART_PRODUCT_NOT_FOUND: sản phẩm #${productId} hiện không còn đủ điều kiện mua (hết hàng, hết hạn mở bán hoặc chưa publish) hoặc không tồn tại. Đã tải lại danh sách.`;
+        return;
+      }
+      throw e;
+    }
   });
 }
 async function loadCart() { await guard(async () => { cart.value = (await call('Xem giỏ', 'GET', '/web/cart')).data; await refreshPreview(); }); }
@@ -118,6 +133,15 @@ async function checkout() {
 }
 // ---- buyer information: every block is a real GET, labelled with the API it came from
 const info = reactive({ loading: false, blocks: [], at: '' });
+const COMMITMENT_PURPOSES = ['COMMITMENT_TEMPLATE_PURCHASE', 'CART_CHECKOUT'];
+function commitmentOrders(list) {
+  return (Array.isArray(list) ? list : [])
+    .filter((o) => COMMITMENT_PURPOSES.includes(o.purpose))
+    .map((o) => ({
+      txnRef: o.txnRef, purpose: o.purpose, amountVnd: o.amountVnd, status: o.status,
+      fulfillmentStatus: o.fulfillmentStatus, paidAt: o.paidAt, fulfilledAt: o.fulfilledAt, createdAt: o.createdAt,
+    }));
+}
 const SOURCES = [
   ['Hồ sơ', '/mobile/profiles/me'],
   ['eKYC', '/mobile/ekyc/status'],
@@ -126,15 +150,18 @@ const SOURCES = [
   ['Mã giới thiệu', '/mobile/referrals/my-code'],
   ['Đơn thanh toán (5 gần nhất)', '/web/payments/orders', { limit: 5 }],
   ['Voucher đã mua', '/mobile/vouchers/purchase-history', { limit: 5 }],
+  // Backend chưa có API liệt kê kho thẻ cam kết của người mua, nên lọc từ đơn thanh toán:
+  // mua lẻ (COMMITMENT_TEMPLATE_PURCHASE) và mua qua giỏ (CART_CHECKOUT, có thể kèm voucher).
+  ['Thẻ cam kết đã mua (lọc từ đơn thanh toán)', '/web/payments/orders', { limit: 50 }, commitmentOrders],
 ];
 async function loadInfo() {
   if (!buyer.accessToken) return;
   info.loading = true;
   info.blocks = [];
-  for (const [title, path, query] of SOURCES) {
+  for (const [title, path, query, pick] of SOURCES) {
     const b = { title, path, status: null, data: null, err: '' };
     info.blocks.push(b);
-    try { const res = await request(buyer, 'GET', path, { query }); b.status = res.status ?? 200; b.data = res.data; }
+    try { const res = await request(buyer, 'GET', path, { query }); b.status = res.status ?? 200; b.data = pick ? pick(res.data) : res.data; }
     catch (e) { b.status = e.status || 'ERR'; b.err = `${e.code || ''} ${e.message}`.trim(); }
   }
   info.at = new Date().toLocaleTimeString();
